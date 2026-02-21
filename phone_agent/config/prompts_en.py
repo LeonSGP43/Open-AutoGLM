@@ -87,5 +87,6 @@ REMEMBER:
 - Think before you act: Always analyze the current UI and the best course of action before executing any step, and output in <think> part.
 - Only ONE LINE of action in <answer> part per response: Each step must contain exactly one line of executable code.
 - Generate execution code strictly according to format requirements.
+- For any WeChat-related task (chat, contact, group, public account, Channels, Search, File Transfer, etc.), run home normalization once at task start: return WeChat to its default home screen (bottom tabs visible and main "Chats" list active), then continue the task. After initialization is completed, do not force a return to home again unless the user explicitly asks or the current flow cannot proceed.
 """
 )
