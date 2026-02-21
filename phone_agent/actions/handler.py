@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from phone_agent.config.timing import TIMING_CONFIG
 from phone_agent.device_factory import get_device_factory
+from phone_agent.extractors import WeChatArticleExtractor
 
 
 @dataclass
@@ -50,6 +51,7 @@ class ActionHandler:
         self.model_coord_scale_x, self.model_coord_scale_y = self._resolve_model_coord_scale()
         self._last_tap_point: tuple[int, int] | None = None
         self._same_tap_count = 0
+        self._wechat_extractor: WeChatArticleExtractor | None = None
 
     @staticmethod
     def _safe_float_env(name: str, default: float) -> float:
@@ -434,16 +436,47 @@ class ActionHandler:
         return ActionResult(True, False)
 
     def _handle_note(self, action: dict, width: int, height: int) -> ActionResult:
-        """Handle note action (placeholder for content recording)."""
-        # This action is typically used for recording page content
-        # Implementation depends on specific requirements
+        """Handle note action with WeChat article-aware capture."""
+        note_message = str(action.get("message", "") or "")
+        current_app = ""
+        try:
+            current_app = get_device_factory().get_current_app(self.device_id)
+        except Exception:
+            current_app = ""
+
+        should_capture = (
+            "微信" in current_app
+            or "wechat" in note_message.lower()
+            or "公众号" in note_message
+        )
+        if should_capture:
+            if self._wechat_extractor is None:
+                self._wechat_extractor = WeChatArticleExtractor()
+            capture = self._wechat_extractor.capture(note_message, self.device_id)
+            print(
+                "[wechat-note] "
+                f"title='{capture.title[:40]}' "
+                f"len={len(capture.body_text)} "
+                f"dup={capture.is_duplicate}"
+            )
         return ActionResult(True, False)
 
     def _handle_call_api(self, action: dict, width: int, height: int) -> ActionResult:
-        """Handle API call action (placeholder for summarization)."""
-        # This action is typically used for content summarization
-        # Implementation depends on specific requirements
-        return ActionResult(True, False)
+        """Handle API call action for WeChat extraction export."""
+        instruction = str(action.get("instruction", "") or "")
+        normalized = instruction.lower()
+        is_wechat_call = (
+            "wechat" in normalized
+            or "公众号" in instruction
+            or "extract" in normalized
+            or "导出" in instruction
+            or "提取" in instruction
+        )
+        if is_wechat_call and self._wechat_extractor is not None:
+            message = self._wechat_extractor.export(instruction, self.device_id)
+            print(f"[wechat-export] {message}")
+            return ActionResult(True, False, message=message)
+        return ActionResult(True, False, message="Call_API completed")
 
     def _handle_interact(self, action: dict, width: int, height: int) -> ActionResult:
         """Handle interaction request (user choice needed)."""
