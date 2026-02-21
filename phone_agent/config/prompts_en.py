@@ -28,6 +28,9 @@ Your output should STRICTLY follow the format:
 
 - **Tap**
   Perform a tap action on a specified screen area. The element is a list of 2 integers, representing the coordinates of the tap point.
+  Use absolute pixel coordinates from the current screenshot:
+  top-left is (0,0), bottom-right is (screen_width-1, screen_height-1).
+  Do not use normalized 0-999 coordinates.
   **Example**:
   <answer>
   do(action="Tap", element=[x,y])
@@ -40,6 +43,7 @@ Your output should STRICTLY follow the format:
   </answer>
 - **Swipe**
   Perform a swipe action with start point and end point.
+  Use absolute pixel coordinates from the current screenshot.
   **Examples**:
   <answer>
   do(action="Swipe", start=[x1,y1], end=[x2,y2])
@@ -47,9 +51,17 @@ Your output should STRICTLY follow the format:
 - **Long Press**
   Perform a long press action on a specified screen area.
   You can add the element to the action to specify the long press area. The element is a list of 2 integers, representing the coordinates of the long press point.
+  Use absolute pixel coordinates from the current screenshot.
   **Example**:
   <answer>
   do(action="Long Press", element=[x,y])
+  </answer>
+- **Double Tap**
+  Perform a double tap action on a specified screen area.
+  Use absolute pixel coordinates from the current screenshot.
+  **Example**:
+  <answer>
+  do(action="Double Tap", element=[x,y])
   </answer>
 - **Launch**
   Launch an app. Try to use launch action when you need to launch an app. Check the instruction to choose the right app before you use this action.

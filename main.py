@@ -40,6 +40,8 @@ from phone_agent.model import ModelConfig
 from phone_agent.xctest import XCTestConnection
 from phone_agent.xctest import list_devices as list_ios_devices
 
+DEFAULT_HTTP_USER_AGENT = "Open-AutoGLM/0.1"
+
 
 def check_system_requirements(
     device_type: DeviceType = DeviceType.ADB, wda_url: str = "http://localhost:8100"
@@ -335,6 +337,7 @@ def check_model_api(
                     "content-type": "application/json",
                     "x-api-key": api_key,
                     "anthropic-version": anthropic_version,
+                    "user-agent": DEFAULT_HTTP_USER_AGENT,
                 },
             )
             with urlopen(req, timeout=30.0) as resp:

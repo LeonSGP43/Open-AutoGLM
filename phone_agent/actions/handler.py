@@ -1,6 +1,7 @@
 """Action handler for processing AI model outputs."""
 
 import ast
+import os
 import re
 import subprocess
 import time
@@ -41,6 +42,11 @@ class ActionHandler:
         self.device_id = device_id
         self.confirmation_callback = confirmation_callback or self._default_confirmation
         self.takeover_callback = takeover_callback or self._default_takeover
+        self.coordinate_mode = os.getenv("PHONE_AGENT_COORDINATE_MODE", "auto").lower()
+        if self.coordinate_mode not in {"auto", "absolute", "relative", "normalized"}:
+            self.coordinate_mode = "auto"
+        self._last_tap_point: tuple[int, int] | None = None
+        self._same_tap_count = 0
 
     def execute(
         self, action: dict[str, Any], screen_width: int, screen_height: int
@@ -107,13 +113,107 @@ class ActionHandler:
         }
         return handlers.get(action_name)
 
-    def _convert_relative_to_absolute(
-        self, element: list[int], screen_width: int, screen_height: int
+    def _clamp_point(self, x: int, y: int, width: int, height: int) -> tuple[int, int]:
+        """Clamp point into current screen bounds."""
+        clamped_x = max(0, min(x, max(0, width - 1)))
+        clamped_y = max(0, min(y, max(0, height - 1)))
+        return clamped_x, clamped_y
+
+    def _convert_element_to_absolute(
+        self, element: list[int | float], screen_width: int, screen_height: int
+    ) -> tuple[int, int, str]:
+        """
+        Convert model coordinates into absolute pixels.
+
+        Supported coordinate formats:
+        - absolute pixel: [x, y]
+        - relative 0-1000: [x, y]
+        - normalized 0-1: [x, y]
+        """
+        if len(element) < 2:
+            raise ValueError("Invalid element coordinates")
+
+        raw_x = float(element[0])
+        raw_y = float(element[1])
+
+        def as_absolute() -> tuple[int, int]:
+            return self._clamp_point(
+                int(round(raw_x)), int(round(raw_y)), screen_width, screen_height
+            )
+
+        def as_relative_1000() -> tuple[int, int]:
+            x = int(round(raw_x / 1000.0 * screen_width))
+            y = int(round(raw_y / 1000.0 * screen_height))
+            return self._clamp_point(x, y, screen_width, screen_height)
+
+        def as_normalized() -> tuple[int, int]:
+            x = int(round(raw_x * screen_width))
+            y = int(round(raw_y * screen_height))
+            return self._clamp_point(x, y, screen_width, screen_height)
+
+        if self.coordinate_mode == "absolute":
+            x, y = as_absolute()
+            return x, y, "absolute(forced)"
+        if self.coordinate_mode == "relative":
+            x, y = as_relative_1000()
+            return x, y, "relative-1000(forced)"
+        if self.coordinate_mode == "normalized":
+            x, y = as_normalized()
+            return x, y, "normalized(forced)"
+
+        # Auto mode:
+        # 1) 0~1 range: normalized
+        # 2) values already in screen bounds: absolute
+        # 3) values out of bounds but <=1000: legacy relative-1000
+        # 4) fallback absolute + clamp
+        if 0.0 <= raw_x <= 1.0 and 0.0 <= raw_y <= 1.0:
+            x, y = as_normalized()
+            return x, y, "normalized(auto)"
+
+        if 0.0 <= raw_x <= screen_width and 0.0 <= raw_y <= screen_height:
+            x, y = as_absolute()
+            return x, y, "absolute(auto)"
+
+        if 0.0 <= raw_x <= 1000.0 and 0.0 <= raw_y <= 1000.0:
+            x, y = as_relative_1000()
+            return x, y, "relative-1000(auto)"
+
+        x, y = as_absolute()
+        return x, y, "absolute-clamped(auto)"
+
+    def _resolve_tap_point(
+        self, x: int, y: int, width: int, height: int
     ) -> tuple[int, int]:
-        """Convert relative coordinates (0-1000) to absolute pixels."""
-        x = int(element[0] / 1000 * screen_width)
-        y = int(element[1] / 1000 * screen_height)
-        return x, y
+        """
+        Resolve tap point with anti-loop micro offsets for repeated same taps.
+
+        This reduces stuck loops when UI does not react to an exact point.
+        """
+        if self._last_tap_point == (x, y):
+            self._same_tap_count += 1
+        else:
+            self._same_tap_count = 0
+            self._last_tap_point = (x, y)
+
+        if self._same_tap_count < 2:
+            return x, y
+
+        offsets = [
+            (12, 0),
+            (-12, 0),
+            (0, -12),
+            (0, 12),
+            (18, -18),
+            (-18, -18),
+            (18, 18),
+            (-18, 18),
+        ]
+        offset = offsets[(self._same_tap_count - 2) % len(offsets)]
+        adjusted = self._clamp_point(x + offset[0], y + offset[1], width, height)
+        print(
+            f"[tap-adjust] repeated tap detected, apply offset {offset}: ({x}, {y}) -> {adjusted}"
+        )
+        return adjusted
 
     def _handle_launch(self, action: dict, width: int, height: int) -> ActionResult:
         """Handle app launch action."""
@@ -133,7 +233,9 @@ class ActionHandler:
         if not element:
             return ActionResult(False, False, "No element coordinates")
 
-        x, y = self._convert_relative_to_absolute(element, width, height)
+        x, y, mode = self._convert_element_to_absolute(element, width, height)
+        x, y = self._resolve_tap_point(x, y, width, height)
+        print(f"[coord] tap {element} -> ({x}, {y}) via {mode}")
 
         # Check for sensitive operation
         if "message" in action:
@@ -180,8 +282,14 @@ class ActionHandler:
         if not start or not end:
             return ActionResult(False, False, "Missing swipe coordinates")
 
-        start_x, start_y = self._convert_relative_to_absolute(start, width, height)
-        end_x, end_y = self._convert_relative_to_absolute(end, width, height)
+        start_x, start_y, start_mode = self._convert_element_to_absolute(
+            start, width, height
+        )
+        end_x, end_y, end_mode = self._convert_element_to_absolute(end, width, height)
+        print(
+            f"[coord] swipe start {start} -> ({start_x}, {start_y}) via {start_mode}, "
+            f"end {end} -> ({end_x}, {end_y}) via {end_mode}"
+        )
 
         device_factory = get_device_factory()
         device_factory.swipe(start_x, start_y, end_x, end_y, device_id=self.device_id)
@@ -205,7 +313,8 @@ class ActionHandler:
         if not element:
             return ActionResult(False, False, "No element coordinates")
 
-        x, y = self._convert_relative_to_absolute(element, width, height)
+        x, y, mode = self._convert_element_to_absolute(element, width, height)
+        print(f"[coord] double tap {element} -> ({x}, {y}) via {mode}")
         device_factory = get_device_factory()
         device_factory.double_tap(x, y, self.device_id)
         return ActionResult(True, False)
@@ -216,7 +325,8 @@ class ActionHandler:
         if not element:
             return ActionResult(False, False, "No element coordinates")
 
-        x, y = self._convert_relative_to_absolute(element, width, height)
+        x, y, mode = self._convert_element_to_absolute(element, width, height)
+        print(f"[coord] long press {element} -> ({x}, {y}) via {mode}")
         device_factory = get_device_factory()
         device_factory.long_press(x, y, device_id=self.device_id)
         return ActionResult(True, False)

@@ -15,6 +15,8 @@ except ImportError:  # pragma: no cover - optional when using anthropic provider
 
 from phone_agent.config.i18n import get_message
 
+DEFAULT_HTTP_USER_AGENT = "Open-AutoGLM/0.1"
+
 
 @dataclass
 class ModelConfig:
@@ -212,9 +214,15 @@ class ModelClient:
             "model": self.config.model_name,
             "messages": anthropic_messages,
             "max_tokens": self.config.max_tokens,
-            "temperature": self.config.temperature,
-            "top_p": self.config.top_p,
         }
+        # Some Anthropic-compatible gateways (e.g. certain Bedrock adapters)
+        # reject requests that include both temperature and top_p.
+        if "top_p" in self.config.extra_body:
+            payload["top_p"] = self.config.extra_body["top_p"]
+        elif "temperature" in self.config.extra_body:
+            payload["temperature"] = self.config.extra_body["temperature"]
+        else:
+            payload["temperature"] = self.config.temperature
         if system_prompt:
             payload["system"] = system_prompt
         if self.config.extra_body:
@@ -231,6 +239,7 @@ class ModelClient:
                 "content-type": "application/json",
                 "x-api-key": self.config.api_key,
                 "anthropic-version": self.config.anthropic_version,
+                "user-agent": DEFAULT_HTTP_USER_AGENT,
             },
         )
 
@@ -448,25 +457,38 @@ class ModelClient:
         if "finish(message=" in content:
             parts = content.split("finish(message=", 1)
             thinking = parts[0].strip()
-            action = "finish(message=" + parts[1]
+            action = self._clean_action_text("finish(message=" + parts[1])
             return thinking, action
 
         # Rule 2: Check for do(action=
         if "do(action=" in content:
             parts = content.split("do(action=", 1)
             thinking = parts[0].strip()
-            action = "do(action=" + parts[1]
+            action = self._clean_action_text("do(action=" + parts[1])
             return thinking, action
 
         # Rule 3: Fallback to legacy XML tag parsing
         if "<answer>" in content:
             parts = content.split("<answer>", 1)
             thinking = parts[0].replace("<think>", "").replace("</think>", "").strip()
-            action = parts[1].replace("</answer>", "").strip()
+            action = self._clean_action_text(parts[1])
             return thinking, action
 
         # Rule 4: No markers found, return content as action
-        return "", content
+        return "", self._clean_action_text(content)
+
+    @staticmethod
+    def _clean_action_text(action: str) -> str:
+        """Normalize action string by removing XML wrapper tags and surrounding text."""
+        normalized = action.strip()
+        normalized = normalized.replace("</answer>", "").replace("<answer>", "").strip()
+
+        for marker in ("do(action=", "finish(message="):
+            idx = normalized.find(marker)
+            if idx != -1:
+                normalized = normalized[idx:].strip()
+                break
+        return normalized
 
 
 class MessageBuilder:

@@ -173,7 +173,11 @@ class IOSPhoneAgent:
                 MessageBuilder.create_system_message(self.agent_config.system_prompt)
             )
 
-            screen_info = MessageBuilder.build_screen_info(current_app)
+            screen_info = MessageBuilder.build_screen_info(
+                current_app,
+                screen_width=screenshot.width,
+                screen_height=screenshot.height,
+            )
             text_content = f"{user_prompt}\n\n{screen_info}"
 
             self._context.append(
@@ -182,7 +186,11 @@ class IOSPhoneAgent:
                 )
             )
         else:
-            screen_info = MessageBuilder.build_screen_info(current_app)
+            screen_info = MessageBuilder.build_screen_info(
+                current_app,
+                screen_width=screenshot.width,
+                screen_height=screenshot.height,
+            )
             text_content = f"** Screen Info **\n\n{screen_info}"
 
             self._context.append(
