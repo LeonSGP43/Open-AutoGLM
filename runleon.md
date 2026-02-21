@@ -99,6 +99,42 @@ PATH="$PWD/venv/bin:$PATH" agop python main.py "打开微信在公众号里搜�
 PATH="$PWD/venv/bin:$PATH" agop python main.py --device-id <other_device_id> "打开微信"
 ```
 
+### 主动探索 + 人工干预（训练模式）
+
+训练阶段建议开启 `--training-mode`，并使用 `--takeover-policy auto`（默认）。  
+当 Agent 输出 `Take_over` 时，终端会出现 `[takeover]` 提示，此时你手动在手机上纠偏，完成后按回车继续。
+
+```bash
+PATH="$PWD/venv/bin:$PATH" agop python main.py \
+  --training-mode \
+  --takeover-policy auto \
+  "打开微信，在公众号里搜索春节文章，跳过广告和视频号，提取前3篇文章"
+```
+
+建议做法：
+
+1. 同一类任务连续跑 3~5 次。
+2. 偏航时手动纠偏，不要直接中断任务。
+3. 让任务尽量跑到 finish，便于经验闭环写入。
+
+### 正式执行（避免频繁接管）
+
+正式模式关闭训练，并保持 `auto` 或直接 `never`：
+
+```bash
+# 生产推荐：非训练模式，仅登录/验证码等必要场景允许接管
+PATH="$PWD/venv/bin:$PATH" agop python main.py \
+  --no-training-mode \
+  --takeover-policy auto \
+  "你的任务"
+
+# 严格模式：完全禁止 Take_over
+PATH="$PWD/venv/bin:$PATH" agop python main.py \
+  --no-training-mode \
+  --takeover-policy never \
+  "你的任务"
+```
+
 ## 6. 未来系统使用方式（多设备推荐）
 
 新手机接入请优先看：

@@ -43,6 +43,42 @@ from phone_agent.xctest import list_devices as list_ios_devices
 DEFAULT_HTTP_USER_AGENT = "Open-AutoGLM/0.1"
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    """Parse boolean environment variable."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def build_takeover_callback(lang: str = "cn"):
+    """Build manual takeover callback with explicit start/end markers."""
+
+    def _callback(message: str) -> None:
+        print("\n" + "=" * 50)
+        if lang == "en":
+            print("[takeover] Manual intervention requested by agent.")
+            print(f"[takeover] Reason: {message}")
+            answer = input(
+                "[takeover] Operate on the phone now. Press Enter to resume AI (or type 'abort' to stop): "
+            ).strip()
+        else:
+            print("[takeover] Agent 请求人工干预。")
+            print(f"[takeover] 原因: {message}")
+            answer = input(
+                "[takeover] 请在手机上手动操作，完成后回车继续（输入 abort 可终止）: "
+            ).strip()
+        if answer.lower() in {"abort", "quit", "exit", "q"}:
+            raise KeyboardInterrupt("Manual takeover aborted by user.")
+        if lang == "en":
+            print("[takeover] Manual intervention finished, resuming agent.")
+        else:
+            print("[takeover] 人工干预结束，继续由 Agent 执行。")
+        print("=" * 50 + "\n")
+
+    return _callback
+
+
 def check_system_requirements(
     device_type: DeviceType = DeviceType.ADB, wda_url: str = "http://localhost:8100"
 ) -> bool:
@@ -611,6 +647,32 @@ Examples:
         help="Device type: adb for Android, hdc for HarmonyOS, ios for iPhone (default: adb)",
     )
 
+    training_group = parser.add_mutually_exclusive_group()
+    training_group.add_argument(
+        "--training-mode",
+        dest="training_mode",
+        action="store_true",
+        help="Enable training mode (allow takeover for human correction)",
+    )
+    training_group.add_argument(
+        "--no-training-mode",
+        dest="training_mode",
+        action="store_false",
+        help="Disable training mode",
+    )
+    parser.set_defaults(training_mode=env_flag("PHONE_AGENT_TRAINING_MODE", False))
+
+    parser.add_argument(
+        "--takeover-policy",
+        type=str,
+        choices=["auto", "always", "never"],
+        default=os.getenv("PHONE_AGENT_TAKEOVER_POLICY", "auto"),
+        help=(
+            "Takeover policy: auto (training mode or mandatory auth only), "
+            "always, or never (default: auto)"
+        ),
+    )
+
     parser.add_argument(
         "task",
         nargs="?",
@@ -800,6 +862,10 @@ def main():
 
         set_hdc_verbose(True)
 
+    # Propagate runtime policy to action handlers.
+    os.environ["PHONE_AGENT_TRAINING_MODE"] = "1" if args.training_mode else "0"
+    os.environ["PHONE_AGENT_TAKEOVER_POLICY"] = args.takeover_policy
+
     # Handle --list-apps (no system check needed)
     if args.list_apps:
         if device_type == DeviceType.HDC:
@@ -870,6 +936,7 @@ def main():
         agent = IOSPhoneAgent(
             model_config=model_config,
             agent_config=agent_config,
+            takeover_callback=build_takeover_callback(args.lang),
         )
     else:
         # Create Android/HarmonyOS agent
@@ -883,6 +950,7 @@ def main():
         agent = PhoneAgent(
             model_config=model_config,
             agent_config=agent_config,
+            takeover_callback=build_takeover_callback(args.lang),
         )
 
     # Print header
@@ -898,6 +966,8 @@ def main():
     print(f"Max Steps: {agent_config.max_steps}")
     print(f"Language: {agent_config.lang}")
     print(f"Device Type: {args.device_type.upper()}")
+    print(f"Training Mode: {'ON' if args.training_mode else 'OFF'}")
+    print(f"Takeover Policy: {args.takeover_policy}")
 
     # Show iOS-specific config
     if device_type == DeviceType.IOS:
