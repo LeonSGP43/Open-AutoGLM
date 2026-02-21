@@ -8,19 +8,26 @@ Usage:
 Environment Variables:
     PHONE_AGENT_BASE_URL: Model API base URL (default: http://localhost:8000/v1)
     PHONE_AGENT_MODEL: Model name (default: autoglm-phone-9b)
+    PHONE_AGENT_PROVIDER: Model API provider format (default: openai)
+    PHONE_AGENT_ANTHROPIC_VERSION: Anthropic API version header (default: 2023-06-01)
     PHONE_AGENT_MAX_STEPS: Maximum steps per task (default: 100)
     PHONE_AGENT_WDA_URL: WebDriverAgent URL (default: http://localhost:8100)
     PHONE_AGENT_DEVICE_ID: iOS device UDID for multi-device setups
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional when using anthropic provider only
+    OpenAI = None
 
 from phone_agent.agent_ios import IOSAgentConfig, IOSPhoneAgent
 from phone_agent.config.apps_ios import list_supported_apps
@@ -159,7 +166,23 @@ def check_system_requirements(wda_url: str = "http://localhost:8100") -> bool:
     return all_passed
 
 
-def check_model_api(base_url: str, api_key: str, model_name: str) -> bool:
+def _build_anthropic_messages_url(base_url: str) -> str:
+    """Build Anthropic /v1/messages endpoint from a base URL."""
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/messages"):
+        return normalized
+    if normalized.endswith("/v1"):
+        return normalized + "/messages"
+    return normalized + "/v1/messages"
+
+
+def check_model_api(
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    provider: str = "openai",
+    anthropic_version: str = "2023-06-01",
+) -> bool:
     """
     Check if the model API is accessible and the specified model exists.
 
@@ -179,63 +202,103 @@ def check_model_api(base_url: str, api_key: str, model_name: str) -> bool:
 
     all_passed = True
 
+    provider = provider.lower().strip()
+
     # Check 1: Network connectivity
-    print(f"1. Checking API connectivity ({base_url})...", end=" ")
-    try:
-        # Parse the URL to get host and port
-        parsed = urlparse(base_url)
+    if provider == "anthropic":
+        endpoint = _build_anthropic_messages_url(base_url)
+        print(f"1. Checking API connectivity ({endpoint})...", end=" ")
+        try:
+            payload = {
+                "model": model_name,
+                "max_tokens": 5,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "Hi"}]}
+                ],
+            }
+            req = Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={
+                    "content-type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": anthropic_version,
+                },
+            )
+            with urlopen(req, timeout=30.0) as resp:
+                response_data = json.loads(resp.read().decode("utf-8"))
 
-        # Create OpenAI client
-        client = OpenAI(base_url=base_url, api_key=api_key, timeout=10.0)
-
-        # Try to list models (this tests connectivity)
-        models_response = client.models.list()
-        available_models = [model.id for model in models_response.data]
-
-        print("✅ OK")
-
-        # Check 2: Model exists
-        print(f"2. Checking model '{model_name}'...", end=" ")
-        if model_name in available_models:
-            print("✅ OK")
-        else:
+            if response_data.get("content"):
+                print("✅ OK")
+            else:
+                print("❌ FAILED")
+                print("   Error: Received empty response from API")
+                all_passed = False
+        except HTTPError as e:
             print("❌ FAILED")
-            print(f"   Error: Model '{model_name}' not found.")
-            print(f"   Available models:")
-            for m in available_models[:10]:  # Show first 10 models
-                print(f"     - {m}")
-            if len(available_models) > 10:
-                print(f"     ... and {len(available_models) - 10} more")
+            error_body = e.read().decode("utf-8", errors="replace")
+            print(f"   Error: Anthropic API error ({e.code}): {error_body}")
             all_passed = False
+        except URLError as e:
+            print("❌ FAILED")
+            print(f"   Error: Cannot connect to {endpoint}: {e.reason}")
+            all_passed = False
+        except Exception as e:
+            print("❌ FAILED")
+            print(f"   Error: {e}")
+            all_passed = False
+    else:
+        print(f"1. Checking API connectivity ({base_url})...", end=" ")
+        try:
+            if OpenAI is None:
+                raise ImportError(
+                    "openai package is required for provider=openai. "
+                    "Install it with: pip install openai"
+                )
+            client = OpenAI(base_url=base_url, api_key=api_key, timeout=10.0)
+            models_response = client.models.list()
+            available_models = [model.id for model in models_response.data]
 
-    except Exception as e:
-        print("❌ FAILED")
-        error_msg = str(e)
+            print("✅ OK")
 
-        # Provide more specific error messages
-        if "Connection refused" in error_msg or "Connection error" in error_msg:
-            print(f"   Error: Cannot connect to {base_url}")
-            print("   Solution:")
-            print("     1. Check if the model server is running")
-            print("     2. Verify the base URL is correct")
-            print(f"     3. Try: curl {base_url}/models")
-        elif "timed out" in error_msg.lower() or "timeout" in error_msg.lower():
-            print(f"   Error: Connection to {base_url} timed out")
-            print("   Solution:")
-            print("     1. Check your network connection")
-            print("     2. Verify the server is responding")
-        elif (
-            "Name or service not known" in error_msg
-            or "nodename nor servname" in error_msg
-        ):
-            print(f"   Error: Cannot resolve hostname")
-            print("   Solution:")
-            print("     1. Check the URL is correct")
-            print("     2. Verify DNS settings")
-        else:
-            print(f"   Error: {error_msg}")
-
-        all_passed = False
+            print(f"2. Checking model '{model_name}'...", end=" ")
+            if model_name in available_models:
+                print("✅ OK")
+            else:
+                print("❌ FAILED")
+                print(f"   Error: Model '{model_name}' not found.")
+                print(f"   Available models:")
+                for m in available_models[:10]:
+                    print(f"     - {m}")
+                if len(available_models) > 10:
+                    print(f"     ... and {len(available_models) - 10} more")
+                all_passed = False
+        except Exception as e:
+            print("❌ FAILED")
+            error_msg = str(e)
+            if "Connection refused" in error_msg or "Connection error" in error_msg:
+                print(f"   Error: Cannot connect to {base_url}")
+                print("   Solution:")
+                print("     1. Check if the model server is running")
+                print("     2. Verify the base URL is correct")
+                print(f"     3. Try: curl {base_url}/models")
+            elif "timed out" in error_msg.lower() or "timeout" in error_msg.lower():
+                print(f"   Error: Connection to {base_url} timed out")
+                print("   Solution:")
+                print("     1. Check your network connection")
+                print("     2. Verify the server is responding")
+            elif (
+                "Name or service not known" in error_msg
+                or "nodename nor servname" in error_msg
+            ):
+                print(f"   Error: Cannot resolve hostname")
+                print("   Solution:")
+                print("     1. Check the URL is correct")
+                print("     2. Verify DNS settings")
+            else:
+                print(f"   Error: {error_msg}")
+            all_passed = False
 
     print("-" * 50)
 
@@ -293,6 +356,21 @@ Examples:
         type=str,
         default="EMPTY",
         help="Model API KEY",
+    )
+
+    parser.add_argument(
+        "--provider",
+        type=str,
+        choices=["openai", "anthropic"],
+        default=os.getenv("PHONE_AGENT_PROVIDER", "openai"),
+        help="Model API provider format (openai or anthropic, default: openai)",
+    )
+
+    parser.add_argument(
+        "--anthropic-version",
+        type=str,
+        default=os.getenv("PHONE_AGENT_ANTHROPIC_VERSION", "2023-06-01"),
+        help="Anthropic API version header (only used when --provider anthropic)",
     )
 
     parser.add_argument(
@@ -469,14 +547,22 @@ def main():
         sys.exit(1)
 
     # Check model API connectivity and model availability
-    # if not check_model_api(args.base_url, args.api_key, args.model):
+    # if not check_model_api(
+    #     args.base_url,
+    #     args.api_key,
+    #     args.model,
+    #     provider=args.provider,
+    #     anthropic_version=args.anthropic_version,
+    # ):
     #     sys.exit(1)
 
     # Create configurations
     model_config = ModelConfig(
         base_url=args.base_url,
         model_name=args.model,
-        api_key=args.api_key
+        api_key=args.api_key,
+        provider=args.provider,
+        anthropic_version=args.anthropic_version,
     )
 
     agent_config = IOSAgentConfig(
@@ -499,6 +585,7 @@ def main():
     print("=" * 50)
     print(f"Model: {model_config.model_name}")
     print(f"Base URL: {model_config.base_url}")
+    print(f"Provider: {model_config.provider}")
     print(f"WDA URL: {args.wda_url}")
     print(f"Max Steps: {agent_config.max_steps}")
     print(f"Language: {agent_config.lang}")

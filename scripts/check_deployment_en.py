@@ -1,8 +1,14 @@
 import argparse
 import json
 import os
+import sys
+from pathlib import Path
 
-from openai import OpenAI
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from phone_agent.model import ModelClient, ModelConfig
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -68,6 +74,21 @@ Usage examples:
         help="Frequency penalty parameter (default: 0.2)",
     )
 
+    parser.add_argument(
+        "--provider",
+        type=str,
+        choices=["openai", "anthropic"],
+        default="openai",
+        help="Model API format (openai or anthropic, default: openai)",
+    )
+
+    parser.add_argument(
+        "--anthropic-version",
+        type=str,
+        default="2023-06-01",
+        help="Anthropic API version header (used only when --provider anthropic)",
+    )
+
     args = parser.parse_args()
 
     # Read test messages
@@ -85,35 +106,30 @@ Usage examples:
     print(f"Starting model inference test...")
     print(f"Base URL: {base_url}")
     print(f"Model: {model}")
+    print(f"Provider: {args.provider}")
     print(f"Messages file: {args.messages_file}")
     print("=" * 80)
 
     try:
-        client = OpenAI(
+        config = ModelConfig(
             base_url=base_url,
             api_key=api_key,
-        )
-
-        response = client.chat.completions.create(
-            messages=messages,
-            model=model,
+            provider=args.provider,
+            anthropic_version=args.anthropic_version,
+            model_name=model,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
             frequency_penalty=args.frequency_penalty,
-            stream=False,
+            lang="en",
         )
+        client = ModelClient(config)
+        response = client.request(messages)
 
         print("\nModel inference result:")
         print("=" * 80)
-        print(response.choices[0].message.content)
+        print(response.raw_content)
         print("=" * 80)
-
-        if response.usage:
-            print(f"\nStatistics:")
-            print(f"  - Prompt tokens: {response.usage.prompt_tokens}")
-            print(f"  - Completion tokens: {response.usage.completion_tokens}")
-            print(f"  - Total tokens: {response.usage.total_tokens}")
 
         print(
             f"\nPlease evaluate the above inference result to determine if the model deployment meets expectations."

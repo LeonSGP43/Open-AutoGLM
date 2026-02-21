@@ -1,8 +1,14 @@
 import argparse
 import json
 import os
+import sys
+from pathlib import Path
 
-from openai import OpenAI
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from phone_agent.model import ModelClient, ModelConfig
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -56,6 +62,21 @@ if __name__ == "__main__":
         "--frequency_penalty", type=float, default=0.2, help="频率惩罚参数 (默认: 0.2)"
     )
 
+    parser.add_argument(
+        "--provider",
+        type=str,
+        choices=["openai", "anthropic"],
+        default="openai",
+        help="模型服务接口格式 (openai 或 anthropic，默认: openai)",
+    )
+
+    parser.add_argument(
+        "--anthropic-version",
+        type=str,
+        default="2023-06-01",
+        help="Anthropic API version 请求头 (仅 provider=anthropic 时生效)",
+    )
+
     args = parser.parse_args()
 
     # 读取测试消息
@@ -73,35 +94,30 @@ if __name__ == "__main__":
     print(f"开始测试模型推理...")
     print(f"Base URL: {base_url}")
     print(f"Model: {model}")
+    print(f"Provider: {args.provider}")
     print(f"Messages file: {args.messages_file}")
     print("=" * 80)
 
     try:
-        client = OpenAI(
+        config = ModelConfig(
             base_url=base_url,
             api_key=api_key,
-        )
-
-        response = client.chat.completions.create(
-            messages=messages,
-            model=model,
+            provider=args.provider,
+            anthropic_version=args.anthropic_version,
+            model_name=model,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
             frequency_penalty=args.frequency_penalty,
-            stream=False,
+            lang="cn",
         )
+        client = ModelClient(config)
+        response = client.request(messages)
 
         print("\n模型推理结果:")
         print("=" * 80)
-        print(response.choices[0].message.content)
+        print(response.raw_content)
         print("=" * 80)
-
-        if response.usage:
-            print(f"\n统计信息:")
-            print(f"  - Prompt tokens: {response.usage.prompt_tokens}")
-            print(f"  - Completion tokens: {response.usage.completion_tokens}")
-            print(f"  - Total tokens: {response.usage.total_tokens}")
 
         print(f"\n请根据上述推理结果判断模型部署是否符合预期。")
 
