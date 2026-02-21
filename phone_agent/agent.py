@@ -11,6 +11,7 @@ from phone_agent.actions import ActionHandler
 from phone_agent.actions.handler import do, finish, parse_action
 from phone_agent.config import get_messages, get_system_prompt
 from phone_agent.device_factory import get_device_factory
+from phone_agent.experience import ExperienceHint, ExperienceStore
 from phone_agent.model import ModelClient, ModelConfig
 from phone_agent.model.client import MessageBuilder
 from phone_agent.skills import build_task_skill_prompt
@@ -87,6 +88,8 @@ class PhoneAgent:
             self.agent_config.lang
         )
         self._active_task_skills: list[str] = []
+        self._experience_store = ExperienceStore()
+        self._current_task: str = ""
 
     def run(self, task: str) -> str:
         """
@@ -100,6 +103,7 @@ class PhoneAgent:
         """
         self._context = []
         self._step_count = 0
+        self._current_task = task or ""
         self._prepare_runtime_system_prompt(task)
 
         # First step with user prompt
@@ -135,6 +139,7 @@ class PhoneAgent:
             raise ValueError("Task is required for the first step")
 
         if is_first and task:
+            self._current_task = task
             self._prepare_runtime_system_prompt(task)
 
         return self._execute_step(task, is_first)
@@ -147,6 +152,31 @@ class PhoneAgent:
             self.agent_config.lang
         )
         self._active_task_skills = []
+        self._current_task = ""
+
+    def _append_experience_hint(
+        self, text_content: str, hint: ExperienceHint | None
+    ) -> str:
+        """Append compact experience hint into current step prompt."""
+        if hint is None:
+            return text_content
+        action_json = json.dumps(hint.action, ensure_ascii=False)
+        if len(action_json) > 320:
+            action_json = action_json[:320] + "..."
+        if self.agent_config.lang == "en":
+            hint_text = (
+                "Historical best action for similar state "
+                f"(source={hint.source}, confidence={hint.confidence:.2f}, "
+                f"attempts={hint.attempts}, success_rate={hint.success_rate:.0%}): {action_json}. "
+                "Prefer this action if the current UI matches."
+            )
+            return f"{text_content}\n\n** Experience Hint **\n{hint_text}"
+        hint_text = (
+            "相似状态历史较优动作"
+            f"（来源={hint.source}，置信度={hint.confidence:.2f}，样本={hint.attempts}，成功率={hint.success_rate:.0%}）："
+            f"{action_json}。若当前界面匹配，优先尝试该动作。"
+        )
+        return f"{text_content}\n\n** 经验提示 **\n{hint_text}"
 
     def _prepare_runtime_system_prompt(self, task: str) -> None:
         """Build task-aware runtime system prompt with matched task skills."""
@@ -225,6 +255,19 @@ class PhoneAgent:
         device_factory = get_device_factory()
         screenshot = device_factory.get_screenshot(self.agent_config.device_id)
         current_app = device_factory.get_current_app(self.agent_config.device_id)
+        screen_hash = ExperienceStore.build_screen_hash(
+            screenshot.base64_data, screenshot.width, screenshot.height
+        )
+        hint = self._experience_store.get_hint(
+            task=self._current_task or (user_prompt or ""),
+            current_app=current_app,
+            screen_hash=screen_hash,
+        )
+        if hint and self.agent_config.verbose:
+            print(
+                f"[experience] hint source={hint.source} conf={hint.confidence:.2f} "
+                f"attempts={hint.attempts} success={hint.success_rate:.0%}"
+            )
 
         # Build messages
         if is_first:
@@ -238,6 +281,7 @@ class PhoneAgent:
                 screen_height=screenshot.height,
             )
             text_content = f"{user_prompt}\n\n{screen_info}"
+            text_content = self._append_experience_hint(text_content, hint)
 
             self._context.append(
                 MessageBuilder.create_user_message(
@@ -251,6 +295,7 @@ class PhoneAgent:
                 screen_height=screenshot.height,
             )
             text_content = f"** Screen Info **\n\n{screen_info}"
+            text_content = self._append_experience_hint(text_content, hint)
 
             self._context.append(
                 MessageBuilder.create_user_message(
@@ -347,6 +392,16 @@ class PhoneAgent:
                 f"✅ {msgs['task_completed']}: {result.message or action.get('message', msgs['done'])}"
             )
             print("=" * 50 + "\n")
+
+        self._experience_store.observe(
+            task=self._current_task or (user_prompt or ""),
+            current_app=current_app,
+            screen_hash=screen_hash,
+            action=action,
+            success=result.success,
+            finished=finished,
+            message=result.message or action.get("message"),
+        )
 
         return StepResult(
             success=result.success,
