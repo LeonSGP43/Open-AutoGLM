@@ -237,6 +237,12 @@ class ExperienceStore:
             action = json.loads(action_json)
         except Exception:
             return None
+        if (
+            isinstance(action, dict)
+            and action.get("_metadata") == "do"
+            and str(action.get("action", "") or "") in {"Take_over", "Interact"}
+        ):
+            return None
         attempts_int = int(attempts or 0)
         if attempts_int <= 0:
             return None

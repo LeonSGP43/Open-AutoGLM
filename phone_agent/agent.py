@@ -393,15 +393,18 @@ class PhoneAgent:
             )
             print("=" * 50 + "\n")
 
-        self._experience_store.observe(
-            task=self._current_task or (user_prompt or ""),
-            current_app=current_app,
-            screen_hash=screen_hash,
-            action=action,
-            success=result.success,
-            finished=finished,
-            message=result.message or action.get("message"),
-        )
+        action_name = str(action.get("action", "") or "")
+        skip_learning = action_name in {"Take_over", "Interact"}
+        if not skip_learning:
+            self._experience_store.observe(
+                task=self._current_task or (user_prompt or ""),
+                current_app=current_app,
+                screen_hash=screen_hash,
+                action=action,
+                success=result.success,
+                finished=finished,
+                message=result.message or action.get("message"),
+            )
 
         return StepResult(
             success=result.success,

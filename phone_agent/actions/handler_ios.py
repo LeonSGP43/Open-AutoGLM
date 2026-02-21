@@ -1,5 +1,6 @@
 """Action handler for iOS automation using WebDriverAgent."""
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -49,6 +50,30 @@ class IOSActionHandler:
         self.session_id = session_id
         self.confirmation_callback = confirmation_callback or self._default_confirmation
         self.takeover_callback = takeover_callback or self._default_takeover
+        self._training_mode = self._env_flag("PHONE_AGENT_TRAINING_MODE", False)
+        self._takeover_policy = os.getenv("PHONE_AGENT_TAKEOVER_POLICY", "auto").strip().lower()
+        if self._takeover_policy not in {"auto", "always", "never"}:
+            self._takeover_policy = "auto"
+        self._takeover_required_keywords = (
+            "login",
+            "sign in",
+            "验证码",
+            "captcha",
+            "2fa",
+            "otp",
+            "passcode",
+            "verification",
+            "验证",
+            "授权",
+            "授权码",
+        )
+
+    @staticmethod
+    def _env_flag(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
 
     def execute(
         self, action: dict[str, Any], screen_width: int, screen_height: int
@@ -248,8 +273,26 @@ class IOSActionHandler:
     def _handle_takeover(self, action: dict, width: int, height: int) -> ActionResult:
         """Handle takeover request (login, captcha, etc.)."""
         message = action.get("message", "User intervention required")
+        if not self._should_allow_takeover(message):
+            print("[takeover] skipped by policy")
+            return ActionResult(
+                True,
+                False,
+                message="Take_over skipped by policy (not training mode / not required).",
+            )
         self.takeover_callback(message)
         return ActionResult(True, False)
+
+    def _should_allow_takeover(self, message: str) -> bool:
+        """Determine whether takeover is permitted for this step."""
+        if self._takeover_policy == "always":
+            return True
+        if self._takeover_policy == "never":
+            return False
+        if self._training_mode:
+            return True
+        normalized = str(message or "").lower()
+        return any(keyword in normalized for keyword in self._takeover_required_keywords)
 
     def _handle_note(self, action: dict, width: int, height: int) -> ActionResult:
         """Handle note action (placeholder for content recording)."""
