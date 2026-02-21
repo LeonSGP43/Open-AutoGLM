@@ -182,6 +182,9 @@ print(result)
 | `PHONE_AGENT_API_KEY`     | API key                   | `EMPTY`                      |
 | `PHONE_AGENT_MAX_STEPS`   | Max steps per task        | `100`                        |
 | `PHONE_AGENT_DEVICE_ID`   | ADB device ID             | (auto-detect)                |
+| `PHONE_AGENT_COORD_PROFILE_FILE` | Coordinate profile JSON (per device/model scaling) | `~/.openautoglm/coord_profiles.json` |
+| `PHONE_AGENT_MODEL_COORD_SCALE_X` | Manual X scale override for model coordinates | `1.0` |
+| `PHONE_AGENT_MODEL_COORD_SCALE_Y` | Manual Y scale override for model coordinates | `1.0` |
 | `PHONE_AGENT_LANG`        | Language (`cn`/`en`)      | `cn`                         |
 
 ---
@@ -212,6 +215,32 @@ Enable both in `Settings > Developer Options`:
 
 1. Ensure ADB Keyboard is installed
 2. Enable in `Settings > System > Language & Input > Virtual Keyboard`
+
+### AI Taps Are Consistently Offset
+
+If the model always taps toward center / a scaled position:
+
+1. Run AI closed-loop accuracy test:
+
+```bash
+python scripts/coord_calibration/calc_ai_coord_scale.py --device-id <adb_device_id> --rows 3 --cols 3
+```
+
+2. Save per-device, per-model scale profile:
+
+```bash
+python scripts/coord_calibration/save_coord_profile.py \
+  --report artifacts/coord_calibration/ai_click_accuracy_report.json \
+  --device-id <adb_device_id> \
+  --provider <openai|anthropic> \
+  --model <model_name>
+```
+
+3. Use profile in runtime:
+
+```bash
+PHONE_AGENT_COORD_PROFILE_FILE=~/.openautoglm/coord_profiles.json python main.py ...
+```
 
 ### Windows Encoding Issues
 
@@ -384,6 +413,9 @@ print(result)
 | `PHONE_AGENT_API_KEY`     | API Key          | `EMPTY`                    |
 | `PHONE_AGENT_MAX_STEPS`   | 每个任务最大步数         | `100`                      |
 | `PHONE_AGENT_DEVICE_ID`   | ADB 设备 ID        | (自动检测)                     |
+| `PHONE_AGENT_COORD_PROFILE_FILE` | 坐标补偿配置文件（按设备/模型） | `~/.openautoglm/coord_profiles.json` |
+| `PHONE_AGENT_MODEL_COORD_SCALE_X` | 手动覆盖模型坐标 X 轴缩放 | `1.0` |
+| `PHONE_AGENT_MODEL_COORD_SCALE_Y` | 手动覆盖模型坐标 Y 轴缩放 | `1.0` |
 | `PHONE_AGENT_LANG`        | 语言 (`cn`/`en`)   | `cn`                       |
 
 ---
@@ -414,6 +446,32 @@ adb devices
 
 1. 确保已安装 ADB Keyboard
 2. 在 `设置 > 系统 > 语言和输入法 > 虚拟键盘` 中启用
+
+### AI 点击持续偏移（例如总偏中间）
+
+如果模型点击位置整体偏移，先做闭环标定再运行：
+
+1. 运行 AI 点击精度测试：
+
+```bash
+python scripts/coord_calibration/calc_ai_coord_scale.py --device-id <adb_device_id> --rows 3 --cols 3
+```
+
+2. 将标定结果写入设备配置：
+
+```bash
+python scripts/coord_calibration/save_coord_profile.py \
+  --report artifacts/coord_calibration/ai_click_accuracy_report.json \
+  --device-id <adb_device_id> \
+  --provider <openai|anthropic> \
+  --model <model_name>
+```
+
+3. 运行时加载配置：
+
+```bash
+PHONE_AGENT_COORD_PROFILE_FILE=~/.openautoglm/coord_profiles.json python main.py ...
+```
 
 ### Windows 编码异常
 

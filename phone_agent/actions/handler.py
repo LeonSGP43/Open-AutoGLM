@@ -1,10 +1,12 @@
 """Action handler for processing AI model outputs."""
 
 import ast
+import json
 import os
 import re
 import subprocess
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -45,8 +47,64 @@ class ActionHandler:
         self.coordinate_mode = os.getenv("PHONE_AGENT_COORDINATE_MODE", "auto").lower()
         if self.coordinate_mode not in {"auto", "absolute", "relative", "normalized"}:
             self.coordinate_mode = "auto"
+        self.model_coord_scale_x, self.model_coord_scale_y = self._resolve_model_coord_scale()
         self._last_tap_point: tuple[int, int] | None = None
         self._same_tap_count = 0
+
+    @staticmethod
+    def _safe_float_env(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _resolve_model_coord_scale(self) -> tuple[float, float]:
+        """
+        Resolve model coordinate scale from env vars or optional per-device profile file.
+
+        Priority:
+        1) Explicit env vars PHONE_AGENT_MODEL_COORD_SCALE_X/Y
+        2) Profile file lookup by (device_id, provider, model)
+        3) Default 1.0, 1.0
+        """
+        scale_x_env = os.getenv("PHONE_AGENT_MODEL_COORD_SCALE_X")
+        scale_y_env = os.getenv("PHONE_AGENT_MODEL_COORD_SCALE_Y")
+        if scale_x_env is not None or scale_y_env is not None:
+            return (
+                self._safe_float_env("PHONE_AGENT_MODEL_COORD_SCALE_X", 1.0),
+                self._safe_float_env("PHONE_AGENT_MODEL_COORD_SCALE_Y", 1.0),
+            )
+
+        profile_file = os.getenv(
+            "PHONE_AGENT_COORD_PROFILE_FILE",
+            str(Path.home() / ".openautoglm" / "coord_profiles.json"),
+        )
+        if not self.device_id:
+            return 1.0, 1.0
+
+        try:
+            path = Path(profile_file).expanduser()
+            if not path.exists():
+                return 1.0, 1.0
+            data = json.loads(path.read_text(encoding="utf-8"))
+            profiles = data.get("profiles", {})
+            device_profiles = profiles.get(self.device_id, {})
+            provider = os.getenv("PHONE_AGENT_PROVIDER", "openai")
+            model = os.getenv("PHONE_AGENT_MODEL", "autoglm-phone-9b")
+            key = f"{provider}::{model}"
+            item = device_profiles.get(key)
+            if not isinstance(item, dict):
+                return 1.0, 1.0
+            sx = float(item.get("scale_x", 1.0))
+            sy = float(item.get("scale_y", 1.0))
+            print(
+                f"[coord] loaded profile scale for {self.device_id} {key}: "
+                f"x{sx:.3f}, y{sy:.3f}"
+            )
+            return sx, sy
+        except Exception as e:
+            print(f"[coord] profile load failed: {e}")
+            return 1.0, 1.0
 
     def execute(
         self, action: dict[str, Any], screen_width: int, screen_height: int
@@ -135,10 +193,19 @@ class ActionHandler:
 
         raw_x = float(element[0])
         raw_y = float(element[1])
+        scaled_x = raw_x * self.model_coord_scale_x
+        scaled_y = raw_y * self.model_coord_scale_y
+        scale_applied = (
+            abs(self.model_coord_scale_x - 1.0) > 1e-6
+            or abs(self.model_coord_scale_y - 1.0) > 1e-6
+        )
 
         def as_absolute() -> tuple[int, int]:
             return self._clamp_point(
-                int(round(raw_x)), int(round(raw_y)), screen_width, screen_height
+                int(round(scaled_x if scale_applied else raw_x)),
+                int(round(scaled_y if scale_applied else raw_y)),
+                screen_width,
+                screen_height,
             )
 
         def as_relative_1000() -> tuple[int, int]:
@@ -153,7 +220,13 @@ class ActionHandler:
 
         if self.coordinate_mode == "absolute":
             x, y = as_absolute()
-            return x, y, "absolute(forced)"
+            mode = "absolute(forced)"
+            if scale_applied:
+                mode += (
+                    f"+scale(x{self.model_coord_scale_x:.3f},"
+                    f"y{self.model_coord_scale_y:.3f})"
+                )
+            return x, y, mode
         if self.coordinate_mode == "relative":
             x, y = as_relative_1000()
             return x, y, "relative-1000(forced)"
@@ -172,14 +245,26 @@ class ActionHandler:
 
         if 0.0 <= raw_x <= screen_width and 0.0 <= raw_y <= screen_height:
             x, y = as_absolute()
-            return x, y, "absolute(auto)"
+            mode = "absolute(auto)"
+            if scale_applied:
+                mode += (
+                    f"+scale(x{self.model_coord_scale_x:.3f},"
+                    f"y{self.model_coord_scale_y:.3f})"
+                )
+            return x, y, mode
 
         if 0.0 <= raw_x <= 1000.0 and 0.0 <= raw_y <= 1000.0:
             x, y = as_relative_1000()
             return x, y, "relative-1000(auto)"
 
         x, y = as_absolute()
-        return x, y, "absolute-clamped(auto)"
+        mode = "absolute-clamped(auto)"
+        if scale_applied:
+            mode += (
+                f"+scale(x{self.model_coord_scale_x:.3f},"
+                f"y{self.model_coord_scale_y:.3f})"
+            )
+        return x, y, mode
 
     def _resolve_tap_point(
         self, x: int, y: int, width: int, height: int
