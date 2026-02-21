@@ -1,6 +1,8 @@
 """Main PhoneAgent class for orchestrating phone automation."""
 
+import copy
 import json
+import re
 import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -11,6 +13,7 @@ from phone_agent.config import get_messages, get_system_prompt
 from phone_agent.device_factory import get_device_factory
 from phone_agent.model import ModelClient, ModelConfig
 from phone_agent.model.client import MessageBuilder
+from phone_agent.skills import build_task_skill_prompt
 
 
 @dataclass
@@ -80,6 +83,10 @@ class PhoneAgent:
 
         self._context: list[dict[str, Any]] = []
         self._step_count = 0
+        self._runtime_system_prompt: str = self.agent_config.system_prompt or get_system_prompt(
+            self.agent_config.lang
+        )
+        self._active_task_skills: list[str] = []
 
     def run(self, task: str) -> str:
         """
@@ -93,6 +100,7 @@ class PhoneAgent:
         """
         self._context = []
         self._step_count = 0
+        self._prepare_runtime_system_prompt(task)
 
         # First step with user prompt
         result = self._execute_step(task, is_first=True)
@@ -126,12 +134,86 @@ class PhoneAgent:
         if is_first and not task:
             raise ValueError("Task is required for the first step")
 
+        if is_first and task:
+            self._prepare_runtime_system_prompt(task)
+
         return self._execute_step(task, is_first)
 
     def reset(self) -> None:
         """Reset the agent state for a new task."""
         self._context = []
         self._step_count = 0
+        self._runtime_system_prompt = self.agent_config.system_prompt or get_system_prompt(
+            self.agent_config.lang
+        )
+        self._active_task_skills = []
+
+    def _prepare_runtime_system_prompt(self, task: str) -> None:
+        """Build task-aware runtime system prompt with matched task skills."""
+        base_prompt = self.agent_config.system_prompt or get_system_prompt(self.agent_config.lang)
+        skill_prompt, skill_names = build_task_skill_prompt(task, self.agent_config.lang)
+        self._active_task_skills = skill_names
+        if skill_prompt:
+            self._runtime_system_prompt = f"{base_prompt}\n\n{skill_prompt}"
+            if self.agent_config.verbose:
+                print(f"[task-skills] activated: {', '.join(skill_names)}")
+        else:
+            self._runtime_system_prompt = base_prompt
+
+    @staticmethod
+    def _is_retryable_model_error(error: Exception) -> bool:
+        """Return True when model error is likely transient or policy-filter retryable."""
+        message = str(error).lower()
+        retry_keywords = (
+            "content filtering policy",
+            "http error 500",
+            "anthropic api error (500)",
+            "service unavailable",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "temporarily unavailable",
+        )
+        return any(keyword in message for keyword in retry_keywords)
+
+    @staticmethod
+    def _strip_assistant_thinking(content: Any) -> Any:
+        """Drop verbose assistant thinking blocks to reduce risky context carry-over."""
+        if not isinstance(content, str):
+            return content
+        stripped = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        if stripped:
+            return stripped
+        return '<answer>do(action="Wait", duration="1 seconds")</answer>'
+
+    def _build_retry_context(self, attempt: int) -> list[dict[str, Any]]:
+        """Build a compact context for retry to improve robustness."""
+        if not self._context:
+            return []
+
+        compact_context: list[dict[str, Any]] = []
+        has_system = self._context and self._context[0].get("role") == "system"
+
+        start_idx = 1 if has_system else 0
+        base_messages = self._context[start_idx:]
+        tail_window = max(6, 12 - attempt * 2)
+        tail_messages = base_messages[-tail_window:]
+
+        if has_system:
+            compact_context.append(copy.deepcopy(self._context[0]))
+            compact_context.append(
+                MessageBuilder.create_system_message(
+                    "稳定性要求：仅给出最短必要推理与一个合法动作，不要复述页面大段文本。"
+                )
+            )
+
+        for message in tail_messages:
+            msg = copy.deepcopy(message)
+            if msg.get("role") == "assistant":
+                msg["content"] = self._strip_assistant_thinking(msg.get("content"))
+            compact_context.append(msg)
+
+        return compact_context
 
     def _execute_step(
         self, user_prompt: str | None = None, is_first: bool = False
@@ -147,7 +229,7 @@ class PhoneAgent:
         # Build messages
         if is_first:
             self._context.append(
-                MessageBuilder.create_system_message(self.agent_config.system_prompt)
+                MessageBuilder.create_system_message(self._runtime_system_prompt)
             )
 
             screen_info = MessageBuilder.build_screen_info(
@@ -182,7 +264,31 @@ class PhoneAgent:
             print("\n" + "=" * 50)
             print(f"💭 {msgs['thinking']}:")
             print("-" * 50)
-            response = self.model_client.request(self._context)
+            response = None
+            last_error: Exception | None = None
+            max_attempts = 3
+
+            for attempt in range(max_attempts):
+                try:
+                    response = self.model_client.request(self._context)
+                    break
+                except Exception as e:
+                    last_error = e
+                    should_retry = attempt < (max_attempts - 1) and self._is_retryable_model_error(e)
+                    if not should_retry:
+                        raise
+                    if self.agent_config.verbose:
+                        print(
+                            f"[model-retry] attempt {attempt + 1}/{max_attempts} failed: {e}"
+                        )
+                    self._context = self._build_retry_context(attempt)
+                    if self.agent_config.verbose:
+                        print(
+                            f"[model-retry] retrying with compact context size={len(self._context)}"
+                        )
+
+            if response is None:
+                raise RuntimeError(f"Model response is empty after retries: {last_error}")
         except Exception as e:
             if self.agent_config.verbose:
                 traceback.print_exc()
