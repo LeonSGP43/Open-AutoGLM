@@ -51,6 +51,7 @@ class ModelResponse:
     thinking: str
     action: str
     raw_content: str
+    usage: dict[str, int] | None = None
     # Performance metrics
     time_to_first_token: float | None = None  # Time to first token (seconds)
     time_to_thinking_end: float | None = None  # Time to thinking end (seconds)
@@ -113,24 +114,38 @@ class ModelClient:
         if self.client is None:
             raise ValueError("OpenAI client is not initialized.")
 
-        stream = self.client.chat.completions.create(
-            messages=messages,
-            model=self.config.model_name,
-            max_tokens=self.config.max_tokens,
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
-            frequency_penalty=self.config.frequency_penalty,
-            extra_body=self.config.extra_body,
-            stream=True,
-        )
+        stream_kwargs: dict[str, Any] = {
+            "messages": messages,
+            "model": self.config.model_name,
+            "max_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "frequency_penalty": self.config.frequency_penalty,
+            "extra_body": self.config.extra_body,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        try:
+            stream = self.client.chat.completions.create(**stream_kwargs)
+        except Exception as e:
+            # Some OpenAI-compatible gateways reject stream_options/include_usage.
+            if not self._is_stream_usage_unsupported(e):
+                raise
+            stream_kwargs.pop("stream_options", None)
+            stream = self.client.chat.completions.create(**stream_kwargs)
 
         raw_content = ""
         buffer = ""  # Buffer to hold content that might be part of a marker
         action_markers = ["finish(message=", "do(action="]
         in_action_phase = False  # Track if we've entered the action phase
         first_token_received = False
+        usage: dict[str, int] = {}
 
         for chunk in stream:
+            chunk_usage = self._extract_usage_dict(getattr(chunk, "usage", None))
+            if chunk_usage:
+                usage.update(chunk_usage)
+
             if len(chunk.choices) == 0:
                 continue
             if chunk.choices[0].delta.content is not None:
@@ -200,6 +215,7 @@ class ModelClient:
             thinking=thinking,
             action=action,
             raw_content=raw_content,
+            usage=usage or None,
             time_to_first_token=time_to_first_token,
             time_to_thinking_end=time_to_thinking_end,
             total_time=total_time,
@@ -259,6 +275,7 @@ class ModelClient:
             raise RuntimeError(f"Anthropic API error ({err_type}): {err_msg}")
 
         raw_content = self._extract_anthropic_text(response_data.get("content", []))
+        usage = self._extract_usage_dict(response_data.get("usage"))
         thinking, action = self._parse_response(raw_content)
 
         if thinking:
@@ -278,6 +295,7 @@ class ModelClient:
             thinking=thinking,
             action=action,
             raw_content=raw_content,
+            usage=usage or None,
             time_to_first_token=None,
             time_to_thinking_end=time_to_thinking_end,
             total_time=total_time,
@@ -318,6 +336,60 @@ class ModelClient:
         if normalized.endswith("/v1"):
             return normalized + "/messages"
         return urljoin(normalized + "/", "v1/messages")
+
+    @staticmethod
+    def _is_stream_usage_unsupported(error: Exception) -> bool:
+        """Best-effort check for gateways that reject stream usage options."""
+        message = str(error).lower()
+        markers = (
+            "stream_options",
+            "include_usage",
+            "unknown parameter",
+            "unexpected keyword argument",
+            "extra inputs are not permitted",
+            "invalid_request_error",
+        )
+        return any(marker in message for marker in markers)
+
+    @staticmethod
+    def _extract_usage_dict(raw_usage: Any) -> dict[str, int]:
+        """Normalize usage payload from provider/OpenAI SDK objects."""
+        if raw_usage is None:
+            return {}
+
+        usage_keys = (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+
+        source: dict[str, Any] = {}
+        if isinstance(raw_usage, dict):
+            source = raw_usage
+        elif hasattr(raw_usage, "model_dump"):
+            dumped = raw_usage.model_dump()
+            if isinstance(dumped, dict):
+                source = dumped
+        else:
+            for key in usage_keys:
+                value = getattr(raw_usage, key, None)
+                if value is not None:
+                    source[key] = value
+
+        normalized: dict[str, int] = {}
+        for key in usage_keys:
+            value = source.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                normalized[key] = value
+            elif isinstance(value, float) and value.is_integer():
+                normalized[key] = int(value)
+        return normalized
 
     @staticmethod
     def _extract_anthropic_text(content_blocks: Any) -> str:

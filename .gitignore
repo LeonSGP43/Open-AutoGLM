@@ -54,7 +54,7 @@ Thumbs.db
 *.log
 /tmp/
 screenshots/
-artifacts/coord_calibration/
+artifacts/
 artifacts/wechat_extract/
 artifacts/.DS_Store
 

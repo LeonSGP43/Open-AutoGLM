@@ -30,6 +30,9 @@ class ExperienceHint:
     avg_reward: float
     confidence: float
     source: str  # exact | app
+    consecutive_failures: int = 0
+    last_outcome: int = 0
+    updated_at: int = 0
 
 
 class ExperienceStore:
@@ -69,6 +72,7 @@ class ExperienceStore:
                 successes INTEGER NOT NULL DEFAULT 0,
                 total_reward REAL NOT NULL DEFAULT 0.0,
                 last_outcome INTEGER NOT NULL DEFAULT 0,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (task_signature, current_app, screen_hash, action_json)
             )
@@ -80,6 +84,7 @@ class ExperienceStore:
             ON action_stats(task_signature, current_app, updated_at)
             """
         )
+        self._migrate_schema_if_needed()
         self._conn.commit()
 
     @staticmethod
@@ -115,13 +120,42 @@ class ExperienceStore:
         return reward
 
     @staticmethod
-    def _confidence(attempts: int, success_rate: float, avg_reward: float) -> float:
+    def _confidence(
+        attempts: int,
+        success_rate: float,
+        avg_reward: float,
+        consecutive_failures: int = 0,
+        last_outcome: int = 0,
+        updated_at: int = 0,
+    ) -> float:
         if attempts <= 0:
             return 0.0
         sample_factor = min(1.0, attempts / 6.0)
         reward_factor = max(0.0, min(1.0, (avg_reward + 1.5) / 3.0))
         score = 0.65 * success_rate + 0.35 * reward_factor
-        return max(0.0, min(1.0, score * sample_factor))
+        # Penalize repeated failures and stale experience, boost recent successful feedback.
+        fail_penalty = 1.0 / (1.0 + max(0, consecutive_failures) * 0.7)
+        last_outcome_factor = 1.06 if int(last_outcome) == 1 else 0.90
+        recency_factor = 1.0
+        if updated_at > 0:
+            age_sec = max(0, int(time.time()) - int(updated_at))
+            # Soft half-life around 14 days.
+            recency_factor = max(0.70, min(1.0, 1.0 - (age_sec / (14 * 24 * 3600)) * 0.25))
+        return max(0.0, min(1.0, score * sample_factor * fail_penalty * last_outcome_factor * recency_factor))
+
+    def _migrate_schema_if_needed(self) -> None:
+        """Apply backward-compatible schema migrations."""
+        if self._conn is None:
+            return
+        columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(action_stats)").fetchall()
+            if len(row) > 1
+        }
+        if "consecutive_failures" not in columns:
+            self._conn.execute(
+                "ALTER TABLE action_stats ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"
+            )
 
     def observe(
         self,
@@ -150,14 +184,19 @@ class ExperienceStore:
                     """
                     INSERT INTO action_stats(
                         task_signature, current_app, screen_hash, action_json,
-                        attempts, successes, total_reward, last_outcome, updated_at
-                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+                        attempts, successes, total_reward, last_outcome,
+                        consecutive_failures, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
                     ON CONFLICT(task_signature, current_app, screen_hash, action_json)
                     DO UPDATE SET
                         attempts = attempts + 1,
                         successes = successes + excluded.successes,
                         total_reward = total_reward + excluded.total_reward,
                         last_outcome = excluded.last_outcome,
+                        consecutive_failures = CASE
+                            WHEN excluded.last_outcome = 1 THEN 0
+                            ELSE action_stats.consecutive_failures + 1
+                        END,
                         updated_at = excluded.updated_at
                     """,
                     (
@@ -168,6 +207,7 @@ class ExperienceStore:
                         1 if success else 0,
                         reward,
                         1 if success else 0,
+                        0 if success else 1,
                         now_ts,
                     ),
                 )
@@ -192,18 +232,32 @@ class ExperienceStore:
         required_attempts = min_attempts
         if required_attempts is None:
             required_attempts = max(1, int(os.getenv("PHONE_AGENT_EXPERIENCE_MIN_ATTEMPTS", "2")))
+        max_consecutive_failures = max(
+            0, int(os.getenv("PHONE_AGENT_EXPERIENCE_MAX_CONSECUTIVE_FAILURES", "2"))
+        )
 
         try:
             with self._lock:
                 exact = self._conn.execute(
                     """
-                    SELECT action_json, attempts, successes, total_reward
+                    SELECT action_json, attempts, successes, total_reward,
+                           consecutive_failures, last_outcome, updated_at
                     FROM action_stats
-                    WHERE task_signature = ? AND current_app = ? AND screen_hash = ? AND attempts >= ?
+                    WHERE task_signature = ?
+                      AND current_app = ?
+                      AND screen_hash = ?
+                      AND attempts >= ?
+                      AND consecutive_failures <= ?
                     ORDER BY (total_reward * 1.0 / attempts) DESC, successes DESC, attempts DESC
                     LIMIT 1
                     """,
-                    (task_signature, current_app, screen_hash, required_attempts),
+                    (
+                        task_signature,
+                        current_app,
+                        screen_hash,
+                        required_attempts,
+                        max_consecutive_failures,
+                    ),
                 ).fetchone()
                 if exact:
                     return self._build_hint(exact, source="exact")
@@ -213,15 +267,18 @@ class ExperienceStore:
                     SELECT action_json,
                            SUM(attempts) AS attempts,
                            SUM(successes) AS successes,
-                           SUM(total_reward) AS total_reward
+                           SUM(total_reward) AS total_reward,
+                           MAX(consecutive_failures) AS consecutive_failures,
+                           MAX(last_outcome) AS last_outcome,
+                           MAX(updated_at) AS updated_at
                     FROM action_stats
                     WHERE task_signature = ? AND current_app = ?
                     GROUP BY action_json
-                    HAVING attempts >= ?
+                    HAVING SUM(attempts) >= ? AND MAX(consecutive_failures) <= ?
                     ORDER BY (total_reward * 1.0 / attempts) DESC, successes DESC, attempts DESC
                     LIMIT 1
                     """,
-                    (task_signature, current_app, required_attempts),
+                    (task_signature, current_app, required_attempts, max_consecutive_failures),
                 ).fetchone()
                 if app_level:
                     return self._build_hint(app_level, source="app")
@@ -229,8 +286,58 @@ class ExperienceStore:
             return None
         return None
 
+    def is_action_in_cooldown(
+        self,
+        task: str,
+        current_app: str,
+        screen_hash: str,
+        action: dict[str, Any],
+    ) -> bool:
+        """Return True when a recently failed action should be temporarily blocked."""
+        if not self.enabled or self._conn is None:
+            return False
+        cooldown_sec = max(0, int(os.getenv("PHONE_AGENT_EXPERIENCE_FAILURE_COOLDOWN_SEC", "120")))
+        min_failures = max(1, int(os.getenv("PHONE_AGENT_EXPERIENCE_FAILURE_COOLDOWN_MIN", "2")))
+        if cooldown_sec <= 0:
+            return False
+        task_signature = self.normalize_task(task)
+        if not task_signature or not current_app or not screen_hash or not action:
+            return False
+        action_json = self._action_to_json(action)
+
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    """
+                    SELECT consecutive_failures, last_outcome, updated_at
+                    FROM action_stats
+                    WHERE task_signature = ? AND current_app = ? AND screen_hash = ? AND action_json = ?
+                    LIMIT 1
+                    """,
+                    (task_signature, current_app, screen_hash, action_json),
+                ).fetchone()
+        except sqlite3.Error:
+            return False
+        if not row:
+            return False
+        consecutive_failures, last_outcome, updated_at = row
+        if int(last_outcome or 0) == 1:
+            return False
+        if int(consecutive_failures or 0) < min_failures:
+            return False
+        age_sec = max(0, int(time.time()) - int(updated_at or 0))
+        return age_sec <= cooldown_sec
+
     def _build_hint(self, row: tuple[Any, ...], source: str) -> ExperienceHint | None:
-        action_json, attempts, successes, total_reward = row
+        (
+            action_json,
+            attempts,
+            successes,
+            total_reward,
+            consecutive_failures,
+            last_outcome,
+            updated_at,
+        ) = row
         if not action_json:
             return None
         try:
@@ -250,8 +357,19 @@ class ExperienceStore:
         total_reward_float = float(total_reward or 0.0)
         success_rate = successes_int / attempts_int
         avg_reward = total_reward_float / attempts_int
-        confidence = self._confidence(attempts_int, success_rate, avg_reward)
-        if confidence < 0.15:
+        consecutive_failures_int = int(consecutive_failures or 0)
+        last_outcome_int = int(last_outcome or 0)
+        updated_at_int = int(updated_at or 0)
+        confidence = self._confidence(
+            attempts_int,
+            success_rate,
+            avg_reward,
+            consecutive_failures=consecutive_failures_int,
+            last_outcome=last_outcome_int,
+            updated_at=updated_at_int,
+        )
+        min_confidence = float(os.getenv("PHONE_AGENT_EXPERIENCE_MIN_CONFIDENCE", "0.15"))
+        if confidence < min_confidence:
             return None
         return ExperienceHint(
             action=action,
@@ -260,4 +378,7 @@ class ExperienceStore:
             avg_reward=avg_reward,
             confidence=confidence,
             source=source,
+            consecutive_failures=consecutive_failures_int,
+            last_outcome=last_outcome_int,
+            updated_at=updated_at_int,
         )

@@ -13,6 +13,15 @@ Environment Variables:
     PHONE_AGENT_ANTHROPIC_VERSION: Anthropic API version header (default: 2023-06-01)
     PHONE_AGENT_MAX_STEPS: Maximum steps per task (default: 100)
     PHONE_AGENT_DEVICE_ID: ADB device ID for multi-device setups
+    PHONE_AGENT_SAVE_TOKEN_USAGE: Save per-step token usage logs (default: true)
+    PHONE_AGENT_TOKEN_USAGE_DIR: Directory for token usage logs (default: artifacts/token_usage)
+    PHONE_AGENT_EXPERIENCE_FAST_PATH: Enable high-confidence fast path (default: true)
+    PHONE_AGENT_EXPERIENCE_FAST_PATH_CONFIDENCE: Min confidence for fast path (default: 0.72)
+    PHONE_AGENT_EXPERIENCE_FAST_PATH_MIN_ATTEMPTS: Min attempts for fast path (default: 3)
+    PHONE_AGENT_EXPERIENCE_FAST_PATH_MAX_STREAK: Max consecutive fast-path steps (default: 4)
+    PHONE_AGENT_EXPERIENCE_EXPLORATION_RATE: Prob. to skip fast path for exploration (default: 0.08)
+    PHONE_AGENT_EXPERIENCE_FAST_PATH_EXACT_ONLY: Use fast path only for exact screen-state matches (default: true)
+    PHONE_AGENT_EXPERIENCE_SENSITIVE_GATE: Block fast path for sensitive tap/type contexts (default: true)
 """
 
 import argparse
@@ -49,6 +58,29 @@ def env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Parse integer environment variable with lower bound."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    """Parse float environment variable clamped to [minimum, maximum]."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
 
 
 def build_takeover_callback(lang: str = "cn"):
@@ -563,6 +595,104 @@ Examples:
         help="Maximum steps per task",
     )
 
+    token_usage_group = parser.add_mutually_exclusive_group()
+    token_usage_group.add_argument(
+        "--save-token-usage",
+        dest="save_token_usage",
+        action="store_true",
+        help="Save per-step token usage to JSONL",
+    )
+    token_usage_group.add_argument(
+        "--no-save-token-usage",
+        dest="save_token_usage",
+        action="store_false",
+        help="Disable per-step token usage logging",
+    )
+    parser.set_defaults(
+        save_token_usage=env_flag("PHONE_AGENT_SAVE_TOKEN_USAGE", True)
+    )
+    parser.add_argument(
+        "--token-usage-dir",
+        type=str,
+        default=os.getenv("PHONE_AGENT_TOKEN_USAGE_DIR", "artifacts/token_usage"),
+        help="Directory for per-step token usage logs",
+    )
+
+    fast_path_group = parser.add_mutually_exclusive_group()
+    fast_path_group.add_argument(
+        "--experience-fast-path",
+        dest="experience_fast_path",
+        action="store_true",
+        help="Enable high-confidence fast path from experience store",
+    )
+    fast_path_group.add_argument(
+        "--no-experience-fast-path",
+        dest="experience_fast_path",
+        action="store_false",
+        help="Disable fast-path and always use model decisions",
+    )
+    parser.set_defaults(
+        experience_fast_path=env_flag("PHONE_AGENT_EXPERIENCE_FAST_PATH", True)
+    )
+    parser.add_argument(
+        "--experience-fast-path-confidence",
+        type=float,
+        default=env_float("PHONE_AGENT_EXPERIENCE_FAST_PATH_CONFIDENCE", 0.72, 0.0, 1.0),
+        help="Minimum confidence [0,1] to use fast path (default: 0.72)",
+    )
+    parser.add_argument(
+        "--experience-fast-path-min-attempts",
+        type=int,
+        default=env_int("PHONE_AGENT_EXPERIENCE_FAST_PATH_MIN_ATTEMPTS", 3, minimum=1),
+        help="Minimum historical attempts before fast path (default: 3)",
+    )
+    parser.add_argument(
+        "--experience-fast-path-max-streak",
+        type=int,
+        default=env_int("PHONE_AGENT_EXPERIENCE_FAST_PATH_MAX_STREAK", 4, minimum=1),
+        help="Max consecutive fast-path steps before forcing model step (default: 4)",
+    )
+    parser.add_argument(
+        "--experience-exploration-rate",
+        type=float,
+        default=env_float("PHONE_AGENT_EXPERIENCE_EXPLORATION_RATE", 0.08, 0.0, 1.0),
+        help="Probability [0,1] to skip fast path for exploration (default: 0.08)",
+    )
+    exact_only_group = parser.add_mutually_exclusive_group()
+    exact_only_group.add_argument(
+        "--experience-fast-path-exact-only",
+        dest="experience_fast_path_exact_only",
+        action="store_true",
+        help="Allow fast path only for exact state matches",
+    )
+    exact_only_group.add_argument(
+        "--no-experience-fast-path-exact-only",
+        dest="experience_fast_path_exact_only",
+        action="store_false",
+        help="Allow app-level fast path fallback (less strict)",
+    )
+    parser.set_defaults(
+        experience_fast_path_exact_only=env_flag(
+            "PHONE_AGENT_EXPERIENCE_FAST_PATH_EXACT_ONLY", True
+        )
+    )
+    sensitive_gate_group = parser.add_mutually_exclusive_group()
+    sensitive_gate_group.add_argument(
+        "--experience-sensitive-gate",
+        dest="experience_sensitive_gate",
+        action="store_true",
+        help="Block fast path for sensitive tap/type contexts",
+    )
+    sensitive_gate_group.add_argument(
+        "--no-experience-sensitive-gate",
+        dest="experience_sensitive_gate",
+        action="store_false",
+        help="Disable sensitive fast-path guard (not recommended)",
+    )
+    parser.set_defaults(
+        experience_sensitive_gate=env_flag("PHONE_AGENT_EXPERIENCE_SENSITIVE_GATE", True)
+    )
+
     # Device options
     parser.add_argument(
         "--device-id",
@@ -843,6 +973,16 @@ def handle_device_commands(args) -> bool:
 def main():
     """Main entry point."""
     args = parse_args()
+    args.experience_fast_path_confidence = max(
+        0.0, min(1.0, float(args.experience_fast_path_confidence))
+    )
+    args.experience_exploration_rate = max(
+        0.0, min(1.0, float(args.experience_exploration_rate))
+    )
+    args.experience_fast_path_min_attempts = max(
+        1, int(args.experience_fast_path_min_attempts)
+    )
+    args.experience_fast_path_max_streak = max(1, int(args.experience_fast_path_max_streak))
 
     # Set device type globally based on args
     if args.device_type == "adb":
@@ -931,6 +1071,15 @@ def main():
             device_id=args.device_id,
             verbose=not args.quiet,
             lang=args.lang,
+            save_token_usage=args.save_token_usage,
+            token_usage_dir=args.token_usage_dir,
+            experience_fast_path=args.experience_fast_path,
+            experience_fast_path_confidence=args.experience_fast_path_confidence,
+            experience_fast_path_min_attempts=args.experience_fast_path_min_attempts,
+            experience_fast_path_max_streak=args.experience_fast_path_max_streak,
+            experience_exploration_rate=args.experience_exploration_rate,
+            experience_fast_path_exact_only=args.experience_fast_path_exact_only,
+            experience_sensitive_gate=args.experience_sensitive_gate,
         )
 
         agent = IOSPhoneAgent(
@@ -945,6 +1094,15 @@ def main():
             device_id=args.device_id,
             verbose=not args.quiet,
             lang=args.lang,
+            save_token_usage=args.save_token_usage,
+            token_usage_dir=args.token_usage_dir,
+            experience_fast_path=args.experience_fast_path,
+            experience_fast_path_confidence=args.experience_fast_path_confidence,
+            experience_fast_path_min_attempts=args.experience_fast_path_min_attempts,
+            experience_fast_path_max_streak=args.experience_fast_path_max_streak,
+            experience_exploration_rate=args.experience_exploration_rate,
+            experience_fast_path_exact_only=args.experience_fast_path_exact_only,
+            experience_sensitive_gate=args.experience_sensitive_gate,
         )
 
         agent = PhoneAgent(
@@ -968,6 +1126,20 @@ def main():
     print(f"Device Type: {args.device_type.upper()}")
     print(f"Training Mode: {'ON' if args.training_mode else 'OFF'}")
     print(f"Takeover Policy: {args.takeover_policy}")
+    print(f"Token Usage Log: {'ON' if args.save_token_usage else 'OFF'}")
+    if args.save_token_usage:
+        print(f"Token Usage Dir: {args.token_usage_dir}")
+    print(f"Experience Fast Path: {'ON' if args.experience_fast_path else 'OFF'}")
+    if args.experience_fast_path:
+        print(
+            "Experience Fast Path Config: "
+            f"conf>={args.experience_fast_path_confidence:.2f}, "
+            f"min_attempts={args.experience_fast_path_min_attempts}, "
+            f"max_streak={args.experience_fast_path_max_streak}, "
+            f"exploration={args.experience_exploration_rate:.2f}, "
+            f"exact_only={'ON' if args.experience_fast_path_exact_only else 'OFF'}, "
+            f"sensitive_gate={'ON' if args.experience_sensitive_gate else 'OFF'}"
+        )
 
     # Show iOS-specific config
     if device_type == DeviceType.IOS:
