@@ -505,6 +505,37 @@ conn.disconnect("192.168.1.100:5555")
 | `PHONE_AGENT_DEVICE_ID`     | ADB/HDC 设备 ID          | (自动检测)                     |
 | `PHONE_AGENT_DEVICE_TYPE`   | 设备类型 (`adb` 或 `hdc`)   | `adb`                      |
 | `PHONE_AGENT_LANG`          | 语言 (`cn` 或 `en`)       | `cn`                       |
+| `PHONE_AGENT_EXPERIENCE_FAST_PATH` | 是否开启经验 fast path       | `true`                     |
+| `PHONE_AGENT_EXPERIENCE_FAST_PATH_CONFIDENCE` | 经验 fast path 最小置信度 | `0.72`                     |
+| `PHONE_AGENT_EXPERIENCE_FAST_PATH_MIN_ATTEMPTS` | 经验 fast path 最小样本数 | `3`                        |
+| `PHONE_AGENT_NAVIGATION_MAP_ENABLED` | 是否开启导航建图学习          | `true`                     |
+| `PHONE_AGENT_NAVIGATION_FAST_PATH` | 是否开启建图 fast path      | `false`                    |
+| `PHONE_AGENT_NAVIGATION_FAST_PATH_CONFIDENCE` | 建图 fast path 最小置信度 | `0.82`                     |
+| `PHONE_AGENT_NAVIGATION_FAST_PATH_MIN_ATTEMPTS` | 建图 fast path 最小样本数 | `6`                        |
+
+### 导航建图与自学习（实验特性）
+
+项目已支持“状态图建模 + 历史转移动作复用”：
+
+- `--navigation-map / --no-navigation-map`：开启/关闭状态图学习
+- `--navigation-fast-path / --no-navigation-fast-path`：开启/关闭建图 fast path
+- `--navigation-fast-path-confidence`：建图 fast path 置信度阈值
+- `--navigation-fast-path-min-attempts`：建图 fast path 最小样本数
+
+建议先运行“只学习不复用”，再打开建图 fast path：
+
+```bash
+# 1) 先学习状态图，不启用建图 fast path
+python main.py --navigation-map --no-navigation-fast-path "打开微信"
+
+# 2) 观察稳定后再启用建图 fast path
+python main.py --navigation-map --navigation-fast-path \
+  --navigation-fast-path-confidence 0.82 \
+  --navigation-fast-path-min-attempts 6 \
+  "打开微信"
+```
+
+开发规划文档：`docs/navigation_map_development_plan.md`
 
 ### 模型配置
 

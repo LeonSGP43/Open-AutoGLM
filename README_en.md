@@ -445,6 +445,37 @@ You can directly modify the corresponding config files to enhance model capabili
 | `PHONE_AGENT_DEVICE_ID`     | ADB/HDC device ID         | (auto-detect)              |
 | `PHONE_AGENT_DEVICE_TYPE`   | Device type (`adb` or `hdc`)| `adb`                    |
 | `PHONE_AGENT_LANG`          | Language (`cn` or `en`)   | `en`                       |
+| `PHONE_AGENT_EXPERIENCE_FAST_PATH` | Enable experience fast path | `true`                 |
+| `PHONE_AGENT_EXPERIENCE_FAST_PATH_CONFIDENCE` | Min confidence for experience fast path | `0.72` |
+| `PHONE_AGENT_EXPERIENCE_FAST_PATH_MIN_ATTEMPTS` | Min samples for experience fast path | `3` |
+| `PHONE_AGENT_NAVIGATION_MAP_ENABLED` | Enable state-graph learning | `true`               |
+| `PHONE_AGENT_NAVIGATION_FAST_PATH` | Enable navigation fast path | `false`              |
+| `PHONE_AGENT_NAVIGATION_FAST_PATH_CONFIDENCE` | Min confidence for navigation fast path | `0.82` |
+| `PHONE_AGENT_NAVIGATION_FAST_PATH_MIN_ATTEMPTS` | Min samples for navigation fast path | `6` |
+
+### Navigation Map Learning (Experimental)
+
+The project now supports state-graph learning and graph-based action reuse:
+
+- `--navigation-map / --no-navigation-map`: enable/disable state-graph learning
+- `--navigation-fast-path / --no-navigation-fast-path`: enable/disable graph fast path
+- `--navigation-fast-path-confidence`: confidence threshold for graph fast path
+- `--navigation-fast-path-min-attempts`: minimum samples for graph fast path
+
+Recommended rollout:
+
+```bash
+# 1) Learn graph first, keep graph fast path OFF
+python main.py --navigation-map --no-navigation-fast-path "Open WeChat"
+
+# 2) Enable graph fast path after stability checks
+python main.py --navigation-map --navigation-fast-path \
+  --navigation-fast-path-confidence 0.82 \
+  --navigation-fast-path-min-attempts 6 \
+  "Open WeChat"
+```
+
+Development plan: `docs/navigation_map_development_plan.md`
 
 ### Model Configuration
 
