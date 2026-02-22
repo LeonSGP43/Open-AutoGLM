@@ -537,6 +537,8 @@ python main.py --navigation-map --navigation-fast-path \
 
 开发规划文档：`docs/navigation_map_development_plan.md`
 
+探索任务参考（可选，模块化任务集）：`docs/navigation_training/README.md`
+
 ### 模型配置
 
 ```python

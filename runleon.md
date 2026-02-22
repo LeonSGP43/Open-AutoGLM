@@ -117,6 +117,10 @@ PATH="$PWD/venv/bin:$PATH" agop python main.py \
 2. 偏航时手动纠偏，不要直接中断任务。
 3. 让任务尽量跑到 finish，便于经验闭环写入。
 
+可选任务参考（模块化；每任务独立 md，App 不存在可跳过）：
+
+- `docs/navigation_training/README.md`
+
 ### 正式执行（避免频繁接管）
 
 正式模式关闭训练，并保持 `auto` 或直接 `never`：

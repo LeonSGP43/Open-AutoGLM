@@ -31,6 +31,19 @@ _SKILL_LIBRARY_DIR = Path(__file__).resolve().parent / "library"
 
 TASK_SKILLS: tuple[TaskSkill, ...] = (
     TaskSkill(
+        name="orientation-lock-normalization",
+        description=(
+            "Preflight orientation normalization: ensure portrait lock is enabled "
+            "before any task actions."
+        ),
+        required_keywords=(),
+        optional_keywords=(),
+        prompt_files={
+            "cn": "orientation-lock-normalization/cn.md",
+            "en": "orientation-lock-normalization/en.md",
+        },
+    ),
+    TaskSkill(
         name="wechat-home-normalization",
         description="Normalize WeChat tasks to the default home tab before task actions.",
         required_keywords=(),
