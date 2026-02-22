@@ -51,9 +51,9 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     if not text:
         return {}
     cleaned = text.strip()
-    cleaned = cleaned.replace("```json", "```").replace("```JSON", "```")
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`").strip()
+    # Remove markdown code fences if present.
+    cleaned = re.sub(r"^```(?:json|JSON)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
     try:
         obj = json.loads(cleaned)
         if isinstance(obj, dict):
@@ -191,6 +191,9 @@ class WeChatArticleExtractor:
         # Fallback: retain plain text when model does not return strict JSON.
         fallback_text = raw.strip()
         if fallback_text:
+            recovered = _extract_json_object(fallback_text)
+            if recovered:
+                return recovered
             print(f"[wechat-ocr] non-json fallback text captured, len={len(fallback_text)}")
             return {
                 "title": "",

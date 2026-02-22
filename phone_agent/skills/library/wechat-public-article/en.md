@@ -10,6 +10,7 @@ Finish one-time startup normalization from `wechat-home-normalization` first, th
 
 1. Result filtering
 - Prefer the "Articles" tab.
+- The top category bar is horizontally scrollable; if "Articles" is not visible, swipe the category bar first and then select it.
 - Skip cards marked as "Ad".
 - Skip Channels, mini-programs, and shopping cards.
 - Count only normal article cards with title + account + time metadata.
@@ -17,6 +18,7 @@ Finish one-time startup normalization from `wechat-home-normalization` first, th
 2. Navigation safety
 - If you enter a mini-program/store page by mistake, immediately go Back.
 - Skipped or mistaken entries must not be counted as completed.
+- After configuring filters (sort/type/time/scope), prefer tapping a blank area to close the filter panel while keeping the applied filters; do not default to tapping "Cancel".
 
 3. Extraction and saving
 - Scroll at least once in each article before classification.
