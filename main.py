@@ -22,6 +22,10 @@ Environment Variables:
     PHONE_AGENT_EXPERIENCE_EXPLORATION_RATE: Prob. to skip fast path for exploration (default: 0.08)
     PHONE_AGENT_EXPERIENCE_FAST_PATH_EXACT_ONLY: Use fast path only for exact screen-state matches (default: true)
     PHONE_AGENT_EXPERIENCE_SENSITIVE_GATE: Block fast path for sensitive tap/type contexts (default: true)
+    PHONE_AGENT_NAVIGATION_MAP_ENABLED: Enable UI state-graph map learning (default: true)
+    PHONE_AGENT_NAVIGATION_FAST_PATH: Enable graph-derived fast path (default: false)
+    PHONE_AGENT_NAVIGATION_FAST_PATH_CONFIDENCE: Min confidence for graph fast path (default: 0.82)
+    PHONE_AGENT_NAVIGATION_FAST_PATH_MIN_ATTEMPTS: Min attempts for graph fast path (default: 6)
 """
 
 import argparse
@@ -692,6 +696,50 @@ Examples:
     parser.set_defaults(
         experience_sensitive_gate=env_flag("PHONE_AGENT_EXPERIENCE_SENSITIVE_GATE", True)
     )
+    navigation_map_group = parser.add_mutually_exclusive_group()
+    navigation_map_group.add_argument(
+        "--navigation-map",
+        dest="navigation_map_enabled",
+        action="store_true",
+        help="Enable state-graph map learning",
+    )
+    navigation_map_group.add_argument(
+        "--no-navigation-map",
+        dest="navigation_map_enabled",
+        action="store_false",
+        help="Disable state-graph map learning",
+    )
+    parser.set_defaults(
+        navigation_map_enabled=env_flag("PHONE_AGENT_NAVIGATION_MAP_ENABLED", True)
+    )
+    navigation_fast_path_group = parser.add_mutually_exclusive_group()
+    navigation_fast_path_group.add_argument(
+        "--navigation-fast-path",
+        dest="navigation_fast_path",
+        action="store_true",
+        help="Enable graph-derived fast path",
+    )
+    navigation_fast_path_group.add_argument(
+        "--no-navigation-fast-path",
+        dest="navigation_fast_path",
+        action="store_false",
+        help="Disable graph-derived fast path",
+    )
+    parser.set_defaults(
+        navigation_fast_path=env_flag("PHONE_AGENT_NAVIGATION_FAST_PATH", False)
+    )
+    parser.add_argument(
+        "--navigation-fast-path-confidence",
+        type=float,
+        default=env_float("PHONE_AGENT_NAVIGATION_FAST_PATH_CONFIDENCE", 0.82, 0.0, 1.0),
+        help="Minimum confidence [0,1] to use graph fast path (default: 0.82)",
+    )
+    parser.add_argument(
+        "--navigation-fast-path-min-attempts",
+        type=int,
+        default=env_int("PHONE_AGENT_NAVIGATION_FAST_PATH_MIN_ATTEMPTS", 6, minimum=1),
+        help="Minimum transition attempts before graph fast path (default: 6)",
+    )
 
     # Device options
     parser.add_argument(
@@ -983,6 +1031,10 @@ def main():
         1, int(args.experience_fast_path_min_attempts)
     )
     args.experience_fast_path_max_streak = max(1, int(args.experience_fast_path_max_streak))
+    args.navigation_fast_path_confidence = max(
+        0.0, min(1.0, float(args.navigation_fast_path_confidence))
+    )
+    args.navigation_fast_path_min_attempts = max(1, int(args.navigation_fast_path_min_attempts))
 
     # Set device type globally based on args
     if args.device_type == "adb":
@@ -1080,6 +1132,10 @@ def main():
             experience_exploration_rate=args.experience_exploration_rate,
             experience_fast_path_exact_only=args.experience_fast_path_exact_only,
             experience_sensitive_gate=args.experience_sensitive_gate,
+            navigation_map_enabled=args.navigation_map_enabled,
+            navigation_fast_path=args.navigation_fast_path,
+            navigation_fast_path_confidence=args.navigation_fast_path_confidence,
+            navigation_fast_path_min_attempts=args.navigation_fast_path_min_attempts,
         )
 
         agent = IOSPhoneAgent(
@@ -1103,6 +1159,10 @@ def main():
             experience_exploration_rate=args.experience_exploration_rate,
             experience_fast_path_exact_only=args.experience_fast_path_exact_only,
             experience_sensitive_gate=args.experience_sensitive_gate,
+            navigation_map_enabled=args.navigation_map_enabled,
+            navigation_fast_path=args.navigation_fast_path,
+            navigation_fast_path_confidence=args.navigation_fast_path_confidence,
+            navigation_fast_path_min_attempts=args.navigation_fast_path_min_attempts,
         )
 
         agent = PhoneAgent(
@@ -1139,6 +1199,14 @@ def main():
             f"exploration={args.experience_exploration_rate:.2f}, "
             f"exact_only={'ON' if args.experience_fast_path_exact_only else 'OFF'}, "
             f"sensitive_gate={'ON' if args.experience_sensitive_gate else 'OFF'}"
+        )
+    print(f"Navigation Map Learning: {'ON' if args.navigation_map_enabled else 'OFF'}")
+    print(f"Navigation Fast Path: {'ON' if args.navigation_fast_path else 'OFF'}")
+    if args.navigation_fast_path:
+        print(
+            "Navigation Fast Path Config: "
+            f"conf>={args.navigation_fast_path_confidence:.2f}, "
+            f"min_attempts={args.navigation_fast_path_min_attempts}"
         )
 
     # Show iOS-specific config

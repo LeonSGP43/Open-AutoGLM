@@ -5,6 +5,7 @@ import json
 import os
 import random
 import re
+import time
 import traceback
 from datetime import datetime
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from phone_agent.device_factory import get_device_factory
 from phone_agent.experience import ExperienceHint, ExperienceStore
 from phone_agent.model import ModelClient, ModelConfig
 from phone_agent.model.client import MessageBuilder, ModelResponse
+from phone_agent.navigation import NavigationActionHint, NavigationMapStore
 from phone_agent.skills import build_task_skill_prompt
 
 
@@ -66,6 +68,10 @@ class AgentConfig:
     experience_exploration_rate: float = 0.08
     experience_fast_path_exact_only: bool = True
     experience_sensitive_gate: bool = True
+    navigation_map_enabled: bool = True
+    navigation_fast_path: bool = False
+    navigation_fast_path_confidence: float = 0.82
+    navigation_fast_path_min_attempts: int = 6
 
     def __post_init__(self):
         if self.system_prompt is None:
@@ -102,6 +108,23 @@ class AgentConfig:
         self.experience_sensitive_gate = _env_flag(
             "PHONE_AGENT_EXPERIENCE_SENSITIVE_GATE",
             self.experience_sensitive_gate,
+        )
+        self.navigation_map_enabled = _env_flag(
+            "PHONE_AGENT_NAVIGATION_MAP_ENABLED", self.navigation_map_enabled
+        )
+        self.navigation_fast_path = _env_flag(
+            "PHONE_AGENT_NAVIGATION_FAST_PATH", self.navigation_fast_path
+        )
+        self.navigation_fast_path_confidence = _env_float(
+            "PHONE_AGENT_NAVIGATION_FAST_PATH_CONFIDENCE",
+            self.navigation_fast_path_confidence,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        self.navigation_fast_path_min_attempts = _env_int(
+            "PHONE_AGENT_NAVIGATION_FAST_PATH_MIN_ATTEMPTS",
+            self.navigation_fast_path_min_attempts,
+            minimum=1,
         )
 
 
@@ -162,10 +185,12 @@ class PhoneAgent:
         )
         self._active_task_skills: list[str] = []
         self._experience_store = ExperienceStore()
+        self._navigation_store = NavigationMapStore(enabled=self.agent_config.navigation_map_enabled)
         self._current_task: str = ""
         self._token_usage_log_file: str | None = None
         self._token_usage_totals: dict[str, int] = {}
         self._fast_path_streak = 0
+        self._pending_transition: dict[str, Any] | None = None
 
     def run(self, task: str) -> str:
         """
@@ -180,6 +205,7 @@ class PhoneAgent:
         self._context = []
         self._step_count = 0
         self._fast_path_streak = 0
+        self._pending_transition = None
         self._current_task = task or ""
         self._prepare_runtime_system_prompt(task)
         self._start_token_usage_log()
@@ -188,6 +214,7 @@ class PhoneAgent:
         result = self._execute_step(task, is_first=True)
 
         if result.finished:
+            self._pending_transition = None
             return result.message or "Task completed"
 
         # Continue until finished or max steps reached
@@ -195,6 +222,7 @@ class PhoneAgent:
             result = self._execute_step(is_first=False)
 
             if result.finished:
+                self._pending_transition = None
                 return result.message or "Task completed"
 
         return "Max steps reached"
@@ -219,6 +247,7 @@ class PhoneAgent:
         if is_first and task:
             self._current_task = task
             self._fast_path_streak = 0
+            self._pending_transition = None
             self._prepare_runtime_system_prompt(task)
             self._start_token_usage_log()
 
@@ -236,6 +265,7 @@ class PhoneAgent:
         self._token_usage_log_file = None
         self._token_usage_totals = {}
         self._fast_path_streak = 0
+        self._pending_transition = None
 
     def _start_token_usage_log(self) -> None:
         """Initialize per-run token usage log file."""
@@ -504,6 +534,55 @@ class PhoneAgent:
                 return False
         return True
 
+    def _resolve_pending_transition(self, current_state_id: str) -> None:
+        """Resolve previous-step transition once the next state is observed."""
+        pending = self._pending_transition
+        if pending is None:
+            return
+        self._pending_transition = None
+        if not current_state_id:
+            return
+        try:
+            self._navigation_store.observe_transition(
+                from_state_id=str(pending.get("from_state_id") or ""),
+                to_state_id=current_state_id,
+                action=pending.get("action") or {},
+                success=bool(pending.get("success")),
+                latency_ms=int(pending.get("latency_ms") or 0),
+            )
+        except Exception:
+            return
+
+    def _should_use_navigation_fast_path(
+        self, hint: NavigationActionHint | None, current_app: str
+    ) -> bool:
+        """Gate map-derived fast path using conservative safety checks."""
+        if hint is None:
+            return False
+        if not self.agent_config.navigation_fast_path:
+            return False
+        if self._fast_path_streak >= self.agent_config.experience_fast_path_max_streak:
+            return False
+        if hint.attempts < self.agent_config.navigation_fast_path_min_attempts:
+            return False
+        if hint.confidence < self.agent_config.navigation_fast_path_confidence:
+            return False
+        if hint.consecutive_failures > 0:
+            return False
+        if not self._is_fast_path_safe_action(hint.action):
+            return False
+        if self.agent_config.experience_sensitive_gate and self._is_sensitive_fast_path_action(
+            hint.action, current_app
+        ):
+            return False
+        action_name = str(hint.action.get("action", "") or "")
+        if action_name in {"Tap", "Type", "Type_Name"}:
+            if hint.confidence < max(0.92, self.agent_config.navigation_fast_path_confidence):
+                return False
+            if hint.attempts < max(10, self.agent_config.navigation_fast_path_min_attempts):
+                return False
+        return True
+
     @staticmethod
     def _contains_sensitive_keyword(text: str) -> bool:
         normalized = (text or "").lower()
@@ -588,6 +667,8 @@ class PhoneAgent:
         screen_hash = ExperienceStore.build_screen_hash(
             screenshot.base64_data, screenshot.width, screenshot.height
         )
+        current_state_id = self._navigation_store.observe_state(current_app=current_app, screen_hash=screen_hash)
+        self._resolve_pending_transition(current_state_id)
         hint = self._experience_store.get_hint(
             task=self._current_task or (user_prompt or ""),
             current_app=current_app,
@@ -597,6 +678,16 @@ class PhoneAgent:
             print(
                 f"[experience] hint source={hint.source} conf={hint.confidence:.2f} "
                 f"attempts={hint.attempts} success={hint.success_rate:.0%}"
+            )
+        nav_hint = self._navigation_store.get_best_action(
+            from_state_id=current_state_id,
+            min_attempts=self.agent_config.navigation_fast_path_min_attempts,
+            min_confidence=self.agent_config.navigation_fast_path_confidence,
+        )
+        if nav_hint and self.agent_config.verbose:
+            print(
+                f"[navigation] hint conf={nav_hint.confidence:.2f} "
+                f"attempts={nav_hint.attempts} success={nav_hint.success_rate:.0%}"
             )
 
         # Build messages
@@ -652,6 +743,19 @@ class PhoneAgent:
             )
             if self.agent_config.verbose:
                 print(f"[experience-fast-path] {thinking_for_step}")
+                print("-" * 50)
+                print(f"🎯 {msgs['action']}:")
+                print(json.dumps(action, ensure_ascii=False, indent=2))
+                print("=" * 50 + "\n")
+        elif self._should_use_navigation_fast_path(nav_hint, current_app):
+            decision_source = "navigation_fast_path"
+            action = copy.deepcopy(nav_hint.action)
+            thinking_for_step = (
+                "Using map transition action "
+                f"(confidence={nav_hint.confidence:.2f}, attempts={nav_hint.attempts})."
+            )
+            if self.agent_config.verbose:
+                print(f"[navigation-fast-path] {thinking_for_step}")
                 print("-" * 50)
                 print(f"🎯 {msgs['action']}:")
                 print(json.dumps(action, ensure_ascii=False, indent=2))
@@ -723,6 +827,7 @@ class PhoneAgent:
         self._context[-1] = MessageBuilder.remove_images_from_message(self._context[-1])
 
         # Execute action
+        action_started_at = time.perf_counter()
         try:
             result = self.action_handler.execute(
                 action, screenshot.width, screenshot.height
@@ -733,6 +838,7 @@ class PhoneAgent:
             result = self.action_handler.execute(
                 finish(message=str(e)), screenshot.width, screenshot.height
             )
+        action_latency_ms = int((time.perf_counter() - action_started_at) * 1000)
 
         # Add assistant response to context
         action_text = (
@@ -756,7 +862,7 @@ class PhoneAgent:
             decision_source=decision_source,
         )
 
-        if decision_source == "experience_fast_path" and result.success:
+        if decision_source in {"experience_fast_path", "navigation_fast_path"} and result.success:
             self._fast_path_streak += 1
         else:
             self._fast_path_streak = 0
@@ -771,6 +877,15 @@ class PhoneAgent:
 
         action_name = str(action.get("action", "") or "")
         skip_learning = action_name in {"Take_over", "Interact"}
+        if action.get("_metadata") == "do" and not skip_learning and current_state_id:
+            self._pending_transition = {
+                "from_state_id": current_state_id,
+                "action": copy.deepcopy(action),
+                "success": bool(result.success),
+                "latency_ms": action_latency_ms,
+            }
+        else:
+            self._pending_transition = None
         if not skip_learning:
             self._experience_store.observe(
                 task=self._current_task or (user_prompt or ""),
