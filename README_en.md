@@ -477,6 +477,12 @@ python main.py --navigation-map --navigation-fast-path \
 
 Development plan: `docs/navigation_map_development_plan.md`
 
+Exploration task reference (optional, modular playbooks): `docs/navigation_training/README.md`
+
+Notes:
+- Task playbooks follow "one task per markdown file".
+- If an app is not installed on a device, mark that task as `SKIP` and continue.
+
 ### Model Configuration
 
 ```python
