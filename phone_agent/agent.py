@@ -7,6 +7,7 @@ import random
 import re
 import time
 import traceback
+from collections import Counter
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -72,6 +73,9 @@ class AgentConfig:
     navigation_fast_path: bool = False
     navigation_fast_path_confidence: float = 0.82
     navigation_fast_path_min_attempts: int = 6
+    semantic_learning_enabled: bool = True
+    semantic_stall_threshold: int = 2
+    semantic_fail_streak_limit: int = 3
 
     def __post_init__(self):
         if self.system_prompt is None:
@@ -125,6 +129,19 @@ class AgentConfig:
             "PHONE_AGENT_NAVIGATION_FAST_PATH_MIN_ATTEMPTS",
             self.navigation_fast_path_min_attempts,
             minimum=1,
+        )
+        self.semantic_learning_enabled = _env_flag(
+            "PHONE_AGENT_SEMANTIC_LEARNING_ENABLED", self.semantic_learning_enabled
+        )
+        self.semantic_stall_threshold = _env_int(
+            "PHONE_AGENT_SEMANTIC_STALL_THRESHOLD",
+            self.semantic_stall_threshold,
+            minimum=1,
+        )
+        self.semantic_fail_streak_limit = _env_int(
+            "PHONE_AGENT_SEMANTIC_FAIL_STREAK_LIMIT",
+            self.semantic_fail_streak_limit,
+            minimum=0,
         )
 
 
@@ -191,6 +208,11 @@ class PhoneAgent:
         self._token_usage_totals: dict[str, int] = {}
         self._fast_path_streak = 0
         self._pending_transition: dict[str, Any] | None = None
+        self._semantic_stall_signature: str | None = None
+        self._semantic_stall_count = 0
+        self._semantic_fail_streak = 0
+        self._last_semantic_reason: str | None = None
+        self._run_failure_reasons: Counter[str] = Counter()
 
     def run(self, task: str) -> str:
         """
@@ -206,6 +228,11 @@ class PhoneAgent:
         self._step_count = 0
         self._fast_path_streak = 0
         self._pending_transition = None
+        self._semantic_stall_signature = None
+        self._semantic_stall_count = 0
+        self._semantic_fail_streak = 0
+        self._last_semantic_reason = None
+        self._run_failure_reasons = Counter()
         self._current_task = task or ""
         self._prepare_runtime_system_prompt(task)
         self._start_token_usage_log()
@@ -215,6 +242,8 @@ class PhoneAgent:
 
         if result.finished:
             self._pending_transition = None
+            task_success = bool(result.success) and self._message_failure_reason(result.message) is None
+            self._commit_task_outcome(task_success, result.message)
             return result.message or "Task completed"
 
         # Continue until finished or max steps reached
@@ -223,8 +252,12 @@ class PhoneAgent:
 
             if result.finished:
                 self._pending_transition = None
+                task_success = bool(result.success) and self._message_failure_reason(result.message) is None
+                self._commit_task_outcome(task_success, result.message)
                 return result.message or "Task completed"
 
+        self._record_run_failure_reason("max_steps_reached")
+        self._commit_task_outcome(False, "Max steps reached")
         return "Max steps reached"
 
     def step(self, task: str | None = None) -> StepResult:
@@ -248,6 +281,11 @@ class PhoneAgent:
             self._current_task = task
             self._fast_path_streak = 0
             self._pending_transition = None
+            self._semantic_stall_signature = None
+            self._semantic_stall_count = 0
+            self._semantic_fail_streak = 0
+            self._last_semantic_reason = None
+            self._run_failure_reasons = Counter()
             self._prepare_runtime_system_prompt(task)
             self._start_token_usage_log()
 
@@ -266,6 +304,11 @@ class PhoneAgent:
         self._token_usage_totals = {}
         self._fast_path_streak = 0
         self._pending_transition = None
+        self._semantic_stall_signature = None
+        self._semantic_stall_count = 0
+        self._semantic_fail_streak = 0
+        self._last_semantic_reason = None
+        self._run_failure_reasons = Counter()
 
     def _start_token_usage_log(self) -> None:
         """Initialize per-run token usage log file."""
@@ -311,6 +354,8 @@ class PhoneAgent:
         success: bool,
         finished: bool,
         decision_source: str,
+        semantic_success: bool | None = None,
+        semantic_reason: str | None = None,
     ) -> None:
         """Append one JSONL record for each step with token usage."""
         if not self.agent_config.save_token_usage:
@@ -346,6 +391,8 @@ class PhoneAgent:
             "success": success,
             "finished": finished,
             "decision_source": decision_source,
+            "semantic_success": semantic_success,
+            "semantic_reason": semantic_reason,
             "usage": usage,
             "approx_total_tokens": approx_total_tokens,
             "running_totals": self._token_usage_totals,
@@ -366,16 +413,39 @@ class PhoneAgent:
             hint_text = (
                 "Historical best action for similar state "
                 f"(source={hint.source}, confidence={hint.confidence:.2f}, "
-                f"attempts={hint.attempts}, success_rate={hint.success_rate:.0%}): {action_json}. "
+                f"attempts={hint.attempts}, success_rate={hint.success_rate:.0%}, "
+                f"semantic_fail_rate={hint.semantic_failure_rate:.0%}): {action_json}. "
                 "Prefer this action if the current UI matches."
             )
             return f"{text_content}\n\n** Experience Hint **\n{hint_text}"
         hint_text = (
             "相似状态历史较优动作"
-            f"（来源={hint.source}，置信度={hint.confidence:.2f}，样本={hint.attempts}，成功率={hint.success_rate:.0%}）："
+            f"（来源={hint.source}，置信度={hint.confidence:.2f}，样本={hint.attempts}，"
+            f"成功率={hint.success_rate:.0%}，语义失败率={hint.semantic_failure_rate:.0%}）："
             f"{action_json}。若当前界面匹配，优先尝试该动作。"
         )
         return f"{text_content}\n\n** 经验提示 **\n{hint_text}"
+
+    def _append_task_failure_hint(self, text_content: str) -> str:
+        """Append top historical failure reasons for current task."""
+        if not self._current_task:
+            return text_content
+        summary = self._experience_store.get_task_failure_summary(self._current_task, limit=3)
+        if not summary:
+            return text_content
+        if self.agent_config.lang == "en":
+            lines = [f"- {reason} ({count})" for reason, count in summary]
+            return (
+                f"{text_content}\n\n** Task Failure Summary **\n"
+                "Avoid repeating these historical failure patterns:\n"
+                + "\n".join(lines)
+            )
+        lines = [f"- {reason}（{count}）" for reason, count in summary]
+        return (
+            f"{text_content}\n\n** 任务失败摘要 **\n"
+            "请避免重复以下历史失败模式：\n"
+            + "\n".join(lines)
+        )
 
     def _prepare_runtime_system_prompt(self, task: str) -> None:
         """Build task-aware runtime system prompt with matched task skills."""
@@ -485,6 +555,196 @@ class PhoneAgent:
                 continue
             fields.append(f"{key}={json.dumps(value, ensure_ascii=False)}")
         return f"do({', '.join(fields)})"
+
+    @staticmethod
+    def _normalize_app_name(app_name: str) -> str:
+        return re.sub(r"[\s_\-.]+", "", (app_name or "").strip().lower())
+
+    @classmethod
+    def _is_home_like_app(cls, app_name: str) -> bool:
+        normalized = cls._normalize_app_name(app_name)
+        if not normalized:
+            return False
+        home_tokens = ("systemhome", "launcher", "homescreen", "桌面", "主屏")
+        return any(token in normalized for token in home_tokens)
+
+    @classmethod
+    def _app_name_matches(cls, target_app: str, actual_app: str) -> bool:
+        target = cls._normalize_app_name(target_app)
+        actual = cls._normalize_app_name(actual_app)
+        if not target or not actual:
+            return False
+        if target in actual or actual in target:
+            return True
+        aliases = {
+            "微信": {"wechat", "weixin", "tencentmm"},
+            "wechat": {"微信", "weixin", "tencentmm"},
+            "通讯录": {"contacts"},
+            "contacts": {"通讯录"},
+        }
+        expanded_targets = {target}
+        for key, vals in aliases.items():
+            key_n = cls._normalize_app_name(key)
+            vals_n = {cls._normalize_app_name(value) for value in vals}
+            if target == key_n or target in vals_n:
+                expanded_targets.add(key_n)
+                expanded_targets.update(vals_n)
+        return actual in expanded_targets
+
+    @staticmethod
+    def _is_semantic_check_candidate(action: dict[str, Any]) -> bool:
+        if not isinstance(action, dict):
+            return False
+        if action.get("_metadata") != "do":
+            return False
+        action_name = str(action.get("action", "") or "")
+        return action_name not in {"Wait", "Take_over", "Interact", "Note", "Call_API"}
+
+    @staticmethod
+    def _is_state_change_expected(action_name: str) -> bool:
+        return action_name in {
+            "Launch",
+            "Tap",
+            "Back",
+            "Home",
+            "Type",
+            "Type_Name",
+            "Double Tap",
+            "Long Press",
+        }
+
+    def _update_semantic_stall_tracker(
+        self, action: dict[str, Any], current_app: str, screen_hash: str, stalled: bool
+    ) -> int:
+        """Track repeated no-progress actions on the same state."""
+        if not stalled:
+            self._semantic_stall_signature = None
+            self._semantic_stall_count = 0
+            return 0
+        signature = (
+            f"{current_app}|{screen_hash}|"
+            f"{json.dumps(action, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+        )
+        if signature == self._semantic_stall_signature:
+            self._semantic_stall_count += 1
+        else:
+            self._semantic_stall_signature = signature
+            self._semantic_stall_count = 1
+        return self._semantic_stall_count
+
+    def _evaluate_semantic_outcome(
+        self,
+        action: dict[str, Any],
+        current_app: str,
+        screen_hash: str,
+        execution_success: bool,
+        post_app: str,
+        post_screen_hash: str,
+    ) -> tuple[bool, str | None]:
+        """Decide whether an executed action was semantically successful."""
+        if not execution_success:
+            self._update_semantic_stall_tracker(action, current_app, screen_hash, stalled=False)
+            return False, "execution_failed"
+
+        action_name = str(action.get("action", "") or "")
+        if action_name == "Launch":
+            target_app = str(action.get("app", "") or "")
+            if target_app and post_app and not self._app_name_matches(target_app, post_app):
+                return False, f"launch_target_mismatch:{target_app}->{post_app}"
+
+        if action_name in {"Tap", "Swipe", "Long Press", "Double Tap", "Type", "Type_Name"}:
+            if (
+                current_app
+                and post_app
+                and current_app != post_app
+                and not self._is_home_like_app(current_app)
+                and self._is_home_like_app(post_app)
+            ):
+                return False, f"app_drift_to_home:{current_app}->{post_app}"
+
+        stalled = (
+            self._is_state_change_expected(action_name)
+            and bool(post_screen_hash)
+            and post_screen_hash == screen_hash
+        )
+        stall_count = self._update_semantic_stall_tracker(
+            action, current_app, screen_hash, stalled=stalled
+        )
+        if stalled and stall_count >= self.agent_config.semantic_stall_threshold:
+            return False, f"stalled_no_change:{stall_count}"
+
+        return True, None
+
+    def _maybe_force_takeover_on_semantic_streak(
+        self, semantic_success: bool | None, semantic_reason: str | None
+    ) -> str | None:
+        """
+        Stop looping when semantic failures keep repeating.
+
+        Returns a finish message when a hard limit is reached, otherwise None.
+        """
+        limit = max(0, int(self.agent_config.semantic_fail_streak_limit))
+        if limit <= 0:
+            return None
+
+        if semantic_success is False:
+            self._semantic_fail_streak += 1
+            self._last_semantic_reason = semantic_reason or "unknown"
+        elif semantic_success is True:
+            self._semantic_fail_streak = 0
+            self._last_semantic_reason = None
+            return None
+        else:
+            return None
+
+        if self._semantic_fail_streak < limit:
+            return None
+
+        reason = self._last_semantic_reason or "unknown"
+        self._record_run_failure_reason("semantic_fail_streak_limit")
+        self._record_run_failure_reason(f"semantic:{reason}")
+        return (
+            f"need_takeover: semantic_fail_streak={self._semantic_fail_streak}, "
+            f"reason={reason}"
+        )
+
+    @staticmethod
+    def _message_failure_reason(message: str | None) -> str | None:
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return None
+        if "model error" in normalized:
+            return "model_error"
+        if "max steps reached" in normalized:
+            return "max_steps_reached"
+        if any(token in normalized for token in ("fail", "error", "not found", "failed")):
+            return "runtime_error"
+        if any(token in normalized for token in ("失败", "错误", "未找到", "不可获取")):
+            return "runtime_error"
+        return None
+
+    def _record_run_failure_reason(self, reason: str | None) -> None:
+        if not reason:
+            return
+        key = str(reason).strip()[:200]
+        if not key:
+            return
+        self._run_failure_reasons[key] += 1
+
+    def _commit_task_outcome(self, success: bool, message: str | None = None) -> None:
+        """Persist task-level outcome and aggregated failure reasons."""
+        reason_from_message = self._message_failure_reason(message)
+        if not success and reason_from_message:
+            self._record_run_failure_reason(reason_from_message)
+        reasons = [reason for reason, _ in self._run_failure_reasons.most_common(3)]
+        try:
+            self._experience_store.observe_task_outcome(
+                task=self._current_task,
+                success=bool(success),
+                failure_reasons=(None if success else reasons),
+            )
+        except Exception:
+            return
 
     def _should_use_fast_path(
         self,
@@ -702,6 +962,7 @@ class PhoneAgent:
                 screen_height=screenshot.height,
             )
             text_content = f"{user_prompt}\n\n{screen_info}"
+            text_content = self._append_task_failure_hint(text_content)
             text_content = self._append_experience_hint(text_content, hint)
 
             self._context.append(
@@ -716,6 +977,7 @@ class PhoneAgent:
                 screen_height=screenshot.height,
             )
             text_content = f"** Screen Info **\n\n{screen_info}"
+            text_content = self._append_task_failure_hint(text_content)
             text_content = self._append_experience_hint(text_content, hint)
 
             self._context.append(
@@ -852,6 +1114,66 @@ class PhoneAgent:
 
         # Check if finished
         finished = action.get("_metadata") == "finish" or result.should_finish
+        action_name = str(action.get("action", "") or "")
+        skip_learning = action_name in {"Take_over", "Interact"}
+
+        semantic_success: bool | None = None
+        semantic_reason: str | None = None
+        learning_success = bool(result.success)
+
+        if (
+            self.agent_config.semantic_learning_enabled
+            and not skip_learning
+            and self._is_semantic_check_candidate(action)
+        ):
+            post_app = current_app
+            post_screen_hash = screen_hash
+            try:
+                post_screenshot = device_factory.get_screenshot(self.agent_config.device_id)
+                post_app = device_factory.get_current_app(self.agent_config.device_id)
+                post_screen_hash = ExperienceStore.build_screen_hash(
+                    post_screenshot.base64_data, post_screenshot.width, post_screenshot.height
+                )
+            except Exception:
+                # Fall back to app-only verification when screenshot capture is unavailable.
+                try:
+                    post_app = device_factory.get_current_app(self.agent_config.device_id)
+                except Exception:
+                    post_app = current_app
+            semantic_success, semantic_reason = self._evaluate_semantic_outcome(
+                action=action,
+                current_app=current_app,
+                screen_hash=screen_hash,
+                execution_success=bool(result.success),
+                post_app=post_app,
+                post_screen_hash=post_screen_hash,
+            )
+            if semantic_success is False:
+                learning_success = False
+                self._record_run_failure_reason(f"semantic:{semantic_reason or 'unknown'}")
+                if self.agent_config.verbose:
+                    print(f"[experience] semantic-fail reason={semantic_reason}")
+        else:
+            # Reset stall tracker when semantic checks are bypassed.
+            self._update_semantic_stall_tracker(
+                action, current_app, screen_hash, stalled=False
+            )
+        forced_takeover_message = self._maybe_force_takeover_on_semantic_streak(
+            semantic_success, semantic_reason
+        )
+        if forced_takeover_message and not finished:
+            result.success = False
+            result.should_finish = True
+            result.message = forced_takeover_message
+            finished = True
+            learning_success = False
+            if self.agent_config.verbose:
+                print(f"[semantic-guard] force-finish: {forced_takeover_message}")
+
+        if not result.success:
+            self._record_run_failure_reason(
+                self._message_failure_reason(result.message) or "execution_failed"
+            )
 
         self._record_token_usage(
             response=response,
@@ -860,9 +1182,14 @@ class PhoneAgent:
             success=result.success,
             finished=finished,
             decision_source=decision_source,
+            semantic_success=semantic_success,
+            semantic_reason=semantic_reason,
         )
 
-        if decision_source in {"experience_fast_path", "navigation_fast_path"} and result.success:
+        if (
+            decision_source in {"experience_fast_path", "navigation_fast_path"}
+            and learning_success
+        ):
             self._fast_path_streak += 1
         else:
             self._fast_path_streak = 0
@@ -875,26 +1202,30 @@ class PhoneAgent:
             )
             print("=" * 50 + "\n")
 
-        action_name = str(action.get("action", "") or "")
-        skip_learning = action_name in {"Take_over", "Interact"}
         if action.get("_metadata") == "do" and not skip_learning and current_state_id:
             self._pending_transition = {
                 "from_state_id": current_state_id,
                 "action": copy.deepcopy(action),
-                "success": bool(result.success),
+                "success": bool(learning_success),
                 "latency_ms": action_latency_ms,
             }
         else:
             self._pending_transition = None
         if not skip_learning:
+            learning_message = result.message or action.get("message")
+            if semantic_reason:
+                suffix = f"[semantic_fail:{semantic_reason}]"
+                learning_message = f"{learning_message} {suffix}".strip() if learning_message else suffix
             self._experience_store.observe(
                 task=self._current_task or (user_prompt or ""),
                 current_app=current_app,
                 screen_hash=screen_hash,
                 action=action,
-                success=result.success,
+                success=learning_success,
                 finished=finished,
-                message=result.message or action.get("message"),
+                message=learning_message,
+                semantic_success=semantic_success,
+                failure_reason=semantic_reason,
             )
 
         return StepResult(

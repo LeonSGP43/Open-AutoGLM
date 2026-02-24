@@ -33,6 +33,7 @@ class ExperienceHint:
     consecutive_failures: int = 0
     last_outcome: int = 0
     updated_at: int = 0
+    semantic_failure_rate: float = 0.0
 
 
 class ExperienceStore:
@@ -70,6 +71,7 @@ class ExperienceStore:
                 action_json TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 successes INTEGER NOT NULL DEFAULT 0,
+                semantic_failures INTEGER NOT NULL DEFAULT 0,
                 total_reward REAL NOT NULL DEFAULT 0.0,
                 last_outcome INTEGER NOT NULL DEFAULT 0,
                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
@@ -82,6 +84,33 @@ class ExperienceStore:
             """
             CREATE INDEX IF NOT EXISTS idx_action_stats_task_app
             ON action_stats(task_signature, current_app, updated_at)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_outcome_stats (
+                task_signature TEXT NOT NULL PRIMARY KEY,
+                runs INTEGER NOT NULL DEFAULT 0,
+                successes INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_failure_stats (
+                task_signature TEXT NOT NULL,
+                failure_reason TEXT NOT NULL,
+                failures INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (task_signature, failure_reason)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_task_failure_stats_task
+            ON task_failure_stats(task_signature, failures DESC, updated_at DESC)
             """
         )
         self._migrate_schema_if_needed()
@@ -106,7 +135,12 @@ class ExperienceStore:
 
     @staticmethod
     def _estimate_reward(
-        action: dict[str, Any], success: bool, finished: bool, message: str | None
+        action: dict[str, Any],
+        success: bool,
+        finished: bool,
+        message: str | None,
+        semantic_failed: bool = False,
+        failure_reason: str | None = None,
     ) -> float:
         """Estimate step reward from coarse execution outcome."""
         reward = 1.0 if success else -1.0
@@ -117,6 +151,11 @@ class ExperienceStore:
             reward -= 0.5
         if action.get("_metadata") == "finish" and not success:
             reward -= 0.5
+        if semantic_failed:
+            reward -= 0.8
+        reason = (failure_reason or "").lower()
+        if reason and any(keyword in reason for keyword in ("drift", "stalled", "mismatch")):
+            reward -= 0.2
         return reward
 
     @staticmethod
@@ -127,6 +166,7 @@ class ExperienceStore:
         consecutive_failures: int = 0,
         last_outcome: int = 0,
         updated_at: int = 0,
+        semantic_failure_rate: float = 0.0,
     ) -> float:
         if attempts <= 0:
             return 0.0
@@ -141,7 +181,14 @@ class ExperienceStore:
             age_sec = max(0, int(time.time()) - int(updated_at))
             # Soft half-life around 14 days.
             recency_factor = max(0.70, min(1.0, 1.0 - (age_sec / (14 * 24 * 3600)) * 0.25))
-        return max(0.0, min(1.0, score * sample_factor * fail_penalty * last_outcome_factor * recency_factor))
+        semantic_factor = max(0.20, min(1.0, 1.0 - max(0.0, semantic_failure_rate) * 1.2))
+        return max(
+            0.0,
+            min(
+                1.0,
+                score * sample_factor * fail_penalty * last_outcome_factor * recency_factor * semantic_factor,
+            ),
+        )
 
     def _migrate_schema_if_needed(self) -> None:
         """Apply backward-compatible schema migrations."""
@@ -156,6 +203,10 @@ class ExperienceStore:
             self._conn.execute(
                 "ALTER TABLE action_stats ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"
             )
+        if "semantic_failures" not in columns:
+            self._conn.execute(
+                "ALTER TABLE action_stats ADD COLUMN semantic_failures INTEGER NOT NULL DEFAULT 0"
+            )
 
     def observe(
         self,
@@ -166,6 +217,8 @@ class ExperienceStore:
         success: bool,
         finished: bool,
         message: str | None = None,
+        semantic_success: bool | None = None,
+        failure_reason: str | None = None,
     ) -> None:
         """Record one action outcome."""
         if not self.enabled or self._conn is None:
@@ -174,7 +227,18 @@ class ExperienceStore:
         if not task_signature or not current_app or not screen_hash or not action:
             return
 
-        reward = self._estimate_reward(action, success, finished, message)
+        effective_success = bool(success)
+        semantic_failed = semantic_success is False
+        if semantic_failed:
+            effective_success = False
+        reward = self._estimate_reward(
+            action,
+            success=effective_success,
+            finished=finished,
+            message=message,
+            semantic_failed=semantic_failed,
+            failure_reason=failure_reason,
+        )
         action_json = self._action_to_json(action)
         now_ts = int(time.time())
 
@@ -184,13 +248,14 @@ class ExperienceStore:
                     """
                     INSERT INTO action_stats(
                         task_signature, current_app, screen_hash, action_json,
-                        attempts, successes, total_reward, last_outcome,
+                        attempts, successes, semantic_failures, total_reward, last_outcome,
                         consecutive_failures, updated_at
-                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(task_signature, current_app, screen_hash, action_json)
                     DO UPDATE SET
                         attempts = attempts + 1,
                         successes = successes + excluded.successes,
+                        semantic_failures = semantic_failures + excluded.semantic_failures,
                         total_reward = total_reward + excluded.total_reward,
                         last_outcome = excluded.last_outcome,
                         consecutive_failures = CASE
@@ -204,10 +269,11 @@ class ExperienceStore:
                         current_app,
                         screen_hash,
                         action_json,
-                        1 if success else 0,
+                        1 if effective_success else 0,
+                        1 if semantic_failed else 0,
                         reward,
-                        1 if success else 0,
-                        0 if success else 1,
+                        1 if effective_success else 0,
+                        0 if effective_success else 1,
                         now_ts,
                     ),
                 )
@@ -235,12 +301,19 @@ class ExperienceStore:
         max_consecutive_failures = max(
             0, int(os.getenv("PHONE_AGENT_EXPERIENCE_MAX_CONSECUTIVE_FAILURES", "2"))
         )
+        try:
+            max_semantic_failure_rate = float(
+                os.getenv("PHONE_AGENT_EXPERIENCE_MAX_SEMANTIC_FAILURE_RATE", "0.35")
+            )
+        except ValueError:
+            max_semantic_failure_rate = 0.35
+        max_semantic_failure_rate = max(0.0, min(1.0, max_semantic_failure_rate))
 
         try:
             with self._lock:
                 exact = self._conn.execute(
                     """
-                    SELECT action_json, attempts, successes, total_reward,
+                    SELECT action_json, attempts, successes, semantic_failures, total_reward,
                            consecutive_failures, last_outcome, updated_at
                     FROM action_stats
                     WHERE task_signature = ?
@@ -248,6 +321,7 @@ class ExperienceStore:
                       AND screen_hash = ?
                       AND attempts >= ?
                       AND consecutive_failures <= ?
+                      AND (semantic_failures * 1.0 / attempts) <= ?
                     ORDER BY (total_reward * 1.0 / attempts) DESC, successes DESC, attempts DESC
                     LIMIT 1
                     """,
@@ -257,6 +331,7 @@ class ExperienceStore:
                         screen_hash,
                         required_attempts,
                         max_consecutive_failures,
+                        max_semantic_failure_rate,
                     ),
                 ).fetchone()
                 if exact:
@@ -267,6 +342,7 @@ class ExperienceStore:
                     SELECT action_json,
                            SUM(attempts) AS attempts,
                            SUM(successes) AS successes,
+                           SUM(semantic_failures) AS semantic_failures,
                            SUM(total_reward) AS total_reward,
                            MAX(consecutive_failures) AS consecutive_failures,
                            MAX(last_outcome) AS last_outcome,
@@ -275,10 +351,17 @@ class ExperienceStore:
                     WHERE task_signature = ? AND current_app = ?
                     GROUP BY action_json
                     HAVING SUM(attempts) >= ? AND MAX(consecutive_failures) <= ?
+                       AND (SUM(semantic_failures) * 1.0 / SUM(attempts)) <= ?
                     ORDER BY (total_reward * 1.0 / attempts) DESC, successes DESC, attempts DESC
                     LIMIT 1
                     """,
-                    (task_signature, current_app, required_attempts, max_consecutive_failures),
+                    (
+                        task_signature,
+                        current_app,
+                        required_attempts,
+                        max_consecutive_failures,
+                        max_semantic_failure_rate,
+                    ),
                 ).fetchone()
                 if app_level:
                     return self._build_hint(app_level, source="app")
@@ -328,11 +411,96 @@ class ExperienceStore:
         age_sec = max(0, int(time.time()) - int(updated_at or 0))
         return age_sec <= cooldown_sec
 
+    def observe_task_outcome(
+        self,
+        task: str,
+        success: bool,
+        failure_reasons: list[str] | None = None,
+    ) -> None:
+        """Record one task-level outcome and optional failure reasons."""
+        if not self.enabled or self._conn is None:
+            return
+        task_signature = self.normalize_task(task)
+        if not task_signature:
+            return
+        now_ts = int(time.time())
+        reasons = [str(reason).strip() for reason in (failure_reasons or []) if str(reason).strip()]
+
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO task_outcome_stats(task_signature, runs, successes, updated_at)
+                    VALUES (?, 1, ?, ?)
+                    ON CONFLICT(task_signature)
+                    DO UPDATE SET
+                        runs = runs + 1,
+                        successes = successes + excluded.successes,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        task_signature,
+                        1 if success else 0,
+                        now_ts,
+                    ),
+                )
+                if not success and reasons:
+                    for reason in reasons:
+                        self._conn.execute(
+                            """
+                            INSERT INTO task_failure_stats(task_signature, failure_reason, failures, updated_at)
+                            VALUES (?, ?, 1, ?)
+                            ON CONFLICT(task_signature, failure_reason)
+                            DO UPDATE SET
+                                failures = failures + 1,
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                task_signature,
+                                reason[:200],
+                                now_ts,
+                            ),
+                        )
+                self._conn.commit()
+        except sqlite3.Error:
+            return
+
+    def get_task_failure_summary(self, task: str, limit: int = 3) -> list[tuple[str, int]]:
+        """Return top failure reasons for a normalized task signature."""
+        if not self.enabled or self._conn is None:
+            return []
+        task_signature = self.normalize_task(task)
+        if not task_signature:
+            return []
+        max_items = max(1, min(10, int(limit or 3)))
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT failure_reason, failures
+                    FROM task_failure_stats
+                    WHERE task_signature = ?
+                    ORDER BY failures DESC, updated_at DESC
+                    LIMIT ?
+                    """,
+                    (task_signature, max_items),
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+        summary: list[tuple[str, int]] = []
+        for row in rows:
+            reason = str(row[0] or "").strip()
+            failures = int(row[1] or 0)
+            if reason and failures > 0:
+                summary.append((reason, failures))
+        return summary
+
     def _build_hint(self, row: tuple[Any, ...], source: str) -> ExperienceHint | None:
         (
             action_json,
             attempts,
             successes,
+            semantic_failures,
             total_reward,
             consecutive_failures,
             last_outcome,
@@ -354,9 +522,11 @@ class ExperienceStore:
         if attempts_int <= 0:
             return None
         successes_int = int(successes or 0)
+        semantic_failures_int = int(semantic_failures or 0)
         total_reward_float = float(total_reward or 0.0)
         success_rate = successes_int / attempts_int
         avg_reward = total_reward_float / attempts_int
+        semantic_failure_rate = semantic_failures_int / attempts_int
         consecutive_failures_int = int(consecutive_failures or 0)
         last_outcome_int = int(last_outcome or 0)
         updated_at_int = int(updated_at or 0)
@@ -367,6 +537,7 @@ class ExperienceStore:
             consecutive_failures=consecutive_failures_int,
             last_outcome=last_outcome_int,
             updated_at=updated_at_int,
+            semantic_failure_rate=semantic_failure_rate,
         )
         min_confidence = float(os.getenv("PHONE_AGENT_EXPERIENCE_MIN_CONFIDENCE", "0.15"))
         if confidence < min_confidence:
@@ -381,4 +552,5 @@ class ExperienceStore:
             consecutive_failures=consecutive_failures_int,
             last_outcome=last_outcome_int,
             updated_at=updated_at_int,
+            semantic_failure_rate=semantic_failure_rate,
         )
