@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from phone_agent.config.timing import TIMING_CONFIG
 from phone_agent.device_factory import get_device_factory
-from phone_agent.extractors import WeChatArticleExtractor
+from phone_agent.extractors import WeChatArticleExtractor, XPostExtractor
 
 
 @dataclass
@@ -52,6 +52,7 @@ class ActionHandler:
         self._last_tap_point: tuple[int, int] | None = None
         self._same_tap_count = 0
         self._wechat_extractor: WeChatArticleExtractor | None = None
+        self._x_extractor: XPostExtractor | None = None
         self._training_mode = self._env_flag("PHONE_AGENT_TRAINING_MODE", False)
         self._takeover_policy = os.getenv("PHONE_AGENT_TAKEOVER_POLICY", "auto").strip().lower()
         if self._takeover_policy not in {"auto", "always", "never"}:
@@ -478,17 +479,19 @@ class ActionHandler:
         return any(keyword in normalized for keyword in self._takeover_required_keywords)
 
     def _handle_note(self, action: dict, width: int, height: int) -> ActionResult:
-        """Handle note action with WeChat article-aware capture."""
+        """Handle note action with app-aware capture (WeChat/X)."""
         note_message = str(action.get("message", "") or "")
         current_app = ""
         try:
             current_app = get_device_factory().get_current_app(self.device_id)
         except Exception:
             current_app = ""
+        current_app_norm = str(current_app or "").strip().lower()
+        note_norm = note_message.lower()
 
         should_capture = (
             "微信" in current_app
-            or "wechat" in note_message.lower()
+            or "wechat" in note_norm
             or "公众号" in note_message
         )
         if should_capture:
@@ -499,6 +502,31 @@ class ActionHandler:
                 "[wechat-note] "
                 f"title='{capture.title[:40]}' "
                 f"len={len(capture.body_text)} "
+                f"dup={capture.is_duplicate}"
+            )
+
+        is_x_app = current_app_norm in {"twitter", "x"} or "twitter" in current_app_norm
+        x_note_markers = (
+            "x_post",
+            "twitter_post",
+            "tweet",
+            "推文",
+            "帖子",
+            "x_",
+        )
+        should_capture_x = note_norm.startswith("x_") or (
+            is_x_app and any(marker in note_norm for marker in x_note_markers)
+        )
+        if should_capture_x:
+            if self._x_extractor is None:
+                self._x_extractor = XPostExtractor()
+            capture = self._x_extractor.capture(note_message, self.device_id)
+            print(
+                "[x-note] "
+                f"idx={capture.post_index} "
+                f"stage={capture.stage} "
+                f"author='{(capture.author or '')[:24]}' "
+                f"text_len={len(capture.post_text)} "
                 f"dup={capture.is_duplicate}"
             )
         return ActionResult(True, False)
@@ -517,6 +545,17 @@ class ActionHandler:
         if is_wechat_call and self._wechat_extractor is not None:
             message = self._wechat_extractor.export(instruction, self.device_id)
             print(f"[wechat-export] {message}")
+            return ActionResult(True, False, message=message)
+        is_x_call = (
+            "x_export" in normalized
+            or "twitter_export" in normalized
+            or "tweet_export" in normalized
+            or "推文导出" in instruction
+            or "x导出" in instruction
+        )
+        if is_x_call and self._x_extractor is not None:
+            message = self._x_extractor.export(instruction, self.device_id)
+            print(f"[x-export] {message}")
             return ActionResult(True, False, message=message)
         return ActionResult(True, False, message="Call_API completed")
 
@@ -613,46 +652,106 @@ def parse_action(response: str) -> dict[str, Any]:
         ValueError: If the response cannot be parsed.
     """
     print(f"Parsing action: {response}")
-    try:
-        response = response.strip()
-        if response.startswith('do(action="Type"') or response.startswith(
-            'do(action="Type_Name"'
-        ):
-            text = response.split("text=", 1)[1][1:-2]
-            action = {"_metadata": "do", "action": "Type", "text": text}
-            return action
-        elif response.startswith("do"):
-            # Use AST parsing instead of eval for safety
-            try:
-                # Escape special characters (newlines, tabs, etc.) for valid Python syntax
-                response = response.replace('\n', '\\n')
-                response = response.replace('\r', '\\r')
-                response = response.replace('\t', '\\t')
 
-                tree = ast.parse(response, mode="eval")
+    def _extract_call_from(text: str, start_idx: int) -> str:
+        """Extract one call expression from a given start index."""
+        i = start_idx
+        depth = 0
+        in_quote = False
+        quote_char = ""
+        escaped = False
+        while i < len(text):
+            ch = text[i]
+            if in_quote:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote_char:
+                    in_quote = False
+            else:
+                if ch in {"'", '"'}:
+                    in_quote = True
+                    quote_char = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start_idx : i + 1]
+            i += 1
+        return text[start_idx:]
+
+    def _extract_last_call(text: str) -> str:
+        """Extract last `do(...)` or `finish(...)` call from noisy model text."""
+        if not text:
+            return ""
+        cleaned = text.strip()
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"</?answer>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
+
+        starts: list[int] = []
+        for token in ("do(", "finish("):
+            seek_from = 0
+            while True:
+                idx = cleaned.find(token, seek_from)
+                if idx == -1:
+                    break
+                starts.append(idx)
+                seek_from = idx + 1
+        if not starts:
+            return cleaned
+        calls = [_extract_call_from(cleaned, idx).strip() for idx in sorted(set(starts))]
+        calls = [item for item in calls if item]
+        if not calls:
+            return cleaned
+        return calls[-1]
+
+    def _parse_call_expr(expr: str) -> dict[str, Any]:
+        """Parse do()/finish() call expression into action dict."""
+        parse_errors: list[Exception] = []
+        for candidate in (
+            expr,
+            expr.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t"),
+        ):
+            try:
+                tree = ast.parse(candidate, mode="eval")
                 if not isinstance(tree.body, ast.Call):
                     raise ValueError("Expected a function call")
-
                 call = tree.body
-                # Extract keyword arguments safely
-                action = {"_metadata": "do"}
-                for keyword in call.keywords:
-                    key = keyword.arg
-                    value = ast.literal_eval(keyword.value)
-                    action[key] = value
+                if not isinstance(call.func, ast.Name):
+                    raise ValueError("Expected function name")
+                fn_name = call.func.id
+                if fn_name == "do":
+                    action = {"_metadata": "do"}
+                    for keyword in call.keywords:
+                        if keyword.arg is None:
+                            continue
+                        action[keyword.arg] = ast.literal_eval(keyword.value)
+                    return action
+                if fn_name == "finish":
+                    message = ""
+                    for keyword in call.keywords:
+                        if keyword.arg == "message":
+                            message = ast.literal_eval(keyword.value)
+                            break
+                    if not message and call.args:
+                        message = ast.literal_eval(call.args[0])
+                    return {"_metadata": "finish", "message": str(message)}
+                raise ValueError(f"Unsupported action function: {fn_name}")
+            except (SyntaxError, ValueError) as exc:
+                parse_errors.append(exc)
+        raise ValueError(f"Failed to parse call expression: {parse_errors[-1]}")
 
-                return action
-            except (SyntaxError, ValueError) as e:
-                raise ValueError(f"Failed to parse do() action: {e}")
-
-        elif response.startswith("finish"):
-            action = {
-                "_metadata": "finish",
-                "message": response.replace("finish(message=", "")[1:-2],
-            }
-        else:
-            raise ValueError(f"Failed to parse action: {response}")
-        return action
+    try:
+        expr = _extract_last_call(str(response or ""))
+        if not expr:
+            raise ValueError("Empty action response")
+        if expr.startswith('do(action="Type"') or expr.startswith('do(action="Type_Name"'):
+            text = expr.split("text=", 1)[1][1:-2]
+            return {"_metadata": "do", "action": "Type", "text": text}
+        return _parse_call_expr(expr)
     except Exception as e:
         raise ValueError(f"Failed to parse action: {e}")
 
