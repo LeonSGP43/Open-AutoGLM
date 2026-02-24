@@ -1,0 +1,6 @@
+data/metrics_summary_*.json
+data/metrics_summary_*.md
+public/metrics_dashboard.html
+tools/__pycache__/
+.dev.log
+.dev.pid
